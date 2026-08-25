@@ -43,7 +43,7 @@ func run() int {
 		return 1
 	}
 
-	isolator, err := sandbox.NewBwrapIsolator()
+	isolator, err := sandbox.NewBwrapIsolator(proxyListenAddr)
 	if err != nil {
 		logger.Error("sandbox isolation unavailable", "error", err)
 		return 1

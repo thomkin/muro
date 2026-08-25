@@ -31,24 +31,25 @@ type Server struct {
 	store *state.Store
 
 	mu    sync.RWMutex
-	rules map[string]*Allowlist // keyed by sandbox key ("namespace/name")
+	rules map[string]*Allowlist // keyed by sandbox key (whatever internal/sandbox.Manager passes to SetAllowlist — the sandbox's internal ID, not "namespace/name"; see RegisterSandboxAddr)
+
+	// addrIndex maps a sandbox's assigned outbound loopback address (e.g.
+	// "127.0.0.5" — internal/sandbox's Stage 2 networking, one distinct
+	// 127.0.0.0/8 address per sandbox) to the same sandbox key rules is
+	// keyed by. This is what makes the default SandboxKeyFunc below a real
+	// implementation rather than the placeholder it started as: once a
+	// sandbox's bridged traffic arrives with a distinguishable source
+	// address, resolving "which sandbox is this" is just this lookup.
+	addrIndex map[string]string
 
 	// SandboxKeyFunc resolves which sandbox an incoming connection belongs
 	// to, given its remote address string (net/http's r.RemoteAddr, or a
-	// hijacked net.Conn's RemoteAddr().String()).
-	//
-	// PLACEHOLDER: DESIGN.md §6.2 says real sandboxes get HTTP_PROXY/
-	// HTTPS_PROXY pointing at a loopback address reachable only from inside
-	// that sandbox's own network namespace, and murod resolves the calling
-	// sandbox by which loopback/namespace a connection arrived on. This
-	// package has no real per-sandbox network namespaces to resolve
-	// against in isolation, so the zero-value default here always returns
-	// ("", false) — "no sandbox identified", which the deny-all default
-	// then correctly refuses. cmd/murod replaces this field with real
-	// namespace-based resolution once this package is wired up for real;
-	// tests set it directly to a fixed key. Everything else in this file
-	// (allowlist matching, denial logging, the passthrough relay) is the
-	// actual enforcement logic and is not a placeholder.
+	// hijacked net.Conn's RemoteAddr().String()). The default (set by
+	// NewServer) strips the port and looks the host up in addrIndex,
+	// populated via RegisterSandboxAddr — DESIGN.md §6.2's "murod resolves
+	// the calling sandbox by which loopback/namespace a connection arrived
+	// on," now real rather than a placeholder. Still overridable directly
+	// (tests set it to a fixed key without needing a real bridge).
 	SandboxKeyFunc func(remoteAddr string) (key string, ok bool)
 
 	logger *slog.Logger
@@ -56,14 +57,49 @@ type Server struct {
 
 // NewServer creates a Server backed by store for denied-request logging
 // (DESIGN.md §5's denied-URL event log). Register a per-sandbox allowlist
-// with SetAllowlist before traffic for that sandbox is expected to pass.
+// with SetAllowlist before traffic for that sandbox is expected to pass,
+// and its bridged address with RegisterSandboxAddr so SandboxKeyFunc's
+// default implementation can actually identify it.
 func NewServer(store *state.Store) *Server {
-	return &Server{
-		store:          store,
-		rules:          make(map[string]*Allowlist),
-		SandboxKeyFunc: func(string) (string, bool) { return "", false },
-		logger:         slog.Default(),
+	s := &Server{
+		store:     store,
+		rules:     make(map[string]*Allowlist),
+		addrIndex: make(map[string]string),
+		logger:    slog.Default(),
 	}
+	s.SandboxKeyFunc = s.resolveSandboxKeyByAddr
+	return s
+}
+
+// resolveSandboxKeyByAddr is the real default SandboxKeyFunc: strip the
+// port from remoteAddr and look the resulting host up in addrIndex. An
+// unrecognized address (no sandbox ever registered it, or none was
+// registered at all — e.g. in a test using a fake Isolator) correctly
+// returns ok=false, which the deny-all default then refuses, same as
+// before this was wired up for real.
+func (s *Server) resolveSandboxKeyByAddr(remoteAddr string) (string, bool) {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr // remoteAddr with no port at all — try it as-is
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	key, ok := s.addrIndex[host]
+	return key, ok
+}
+
+// RegisterSandboxAddr records that addr (a sandbox's Stage 2 outbound
+// loopback address, e.g. "127.0.0.5") belongs to sandboxKey, so the
+// default SandboxKeyFunc can resolve future connections from that address
+// back to the right allowlist. This is the ProxyUpdater method
+// internal/sandbox.Manager calls (by duck typing against its own local
+// ProxyUpdater interface, which this package does not import) whenever a
+// Handle exposes a network address — see internal/sandbox/network.go's
+// networkAddrProvider.
+func (s *Server) RegisterSandboxAddr(sandboxKey, addr string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.addrIndex[addr] = sandboxKey
 }
 
 // ListenAndServe starts the proxy on addr and blocks. addr is expected to

@@ -44,9 +44,16 @@ func shellMounts() []config.Mount {
 	return mounts
 }
 
+// testProxyAddr matches cmd/murod's real fixed proxy listen address
+// (proxyListenAddr in cmd/murod/main.go) — tests that need a real listener
+// there (network_test.go) bind exactly this address; tests that don't care
+// about network reachability just need Launch's Stage 2/3 setup to succeed
+// against *some* well-formed address, which this equally serves.
+const testProxyAddr = "127.0.0.1:18080"
+
 func newIsolator(t *testing.T) *sandbox.BwrapIsolator {
 	t.Helper()
-	iso, err := sandbox.NewBwrapIsolator()
+	iso, err := sandbox.NewBwrapIsolator(testProxyAddr)
 	if err != nil {
 		t.Skipf("bwrap isolator unavailable, skipping integration test: %v", err)
 	}

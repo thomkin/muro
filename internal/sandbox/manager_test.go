@@ -20,10 +20,11 @@ func (p *fakePublisher) PublishStatus(namespace, name, event string) error {
 	return nil
 }
 
-// fakeProxy records every SetAllowlist call instead of touching a real
-// internal/proxy.Server (also not wired in yet).
+// fakeProxy records every SetAllowlist/RegisterSandboxAddr call instead of
+// touching a real internal/proxy.Server (also not wired in yet).
 type fakeProxy struct {
 	calls map[string][]string // sandboxID -> last allowURLs set
+	addrs map[string]string   // sandboxID -> last registered network address
 }
 
 func (p *fakeProxy) SetAllowlist(sandboxID string, allowURLs []string) {
@@ -31,6 +32,13 @@ func (p *fakeProxy) SetAllowlist(sandboxID string, allowURLs []string) {
 		p.calls = make(map[string][]string)
 	}
 	p.calls[sandboxID] = allowURLs
+}
+
+func (p *fakeProxy) RegisterSandboxAddr(sandboxID, addr string) {
+	if p.addrs == nil {
+		p.addrs = make(map[string]string)
+	}
+	p.addrs[sandboxID] = addr
 }
 
 func newTestManager(t *testing.T) (*Manager, *fakeIsolator, *fakePublisher) {

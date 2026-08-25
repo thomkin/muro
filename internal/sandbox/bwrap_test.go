@@ -73,9 +73,62 @@ func TestBuildArgs_EnvSortedDeterministic(t *testing.T) {
 			order = append(order, args[i+1])
 		}
 	}
-	if len(order) != 2 || order[0] != "APPLE" || order[1] != "ZEBRA" {
-		t.Errorf("expected sorted env keys [APPLE ZEBRA], got %v", order)
+	// buildArgs also always injects HTTP_PROXY/HTTPS_PROXY (both cases),
+	// so this only checks APPLE/ZEBRA's relative order (still exercises
+	// "env keys are sorted, not map-iteration-order-dependent") rather
+	// than asserting the full env key set, which TestBuildArgs_
+	// InjectsProxyEnv below already covers explicitly.
+	appleIdx, zebraIdx := -1, -1
+	for i, k := range order {
+		if k == "APPLE" {
+			appleIdx = i
+		}
+		if k == "ZEBRA" {
+			zebraIdx = i
+		}
 	}
+	if appleIdx == -1 || zebraIdx == -1 || appleIdx >= zebraIdx {
+		t.Errorf("expected APPLE before ZEBRA in sorted --setenv order, got %v", order)
+	}
+}
+
+func TestBuildArgs_InjectsProxyEnv(t *testing.T) {
+	// The injected proxy URL targets the slirp gateway (10.0.2.2), NOT
+	// proxyAddr's own host — see gatewayProxyAddr/slirpGatewayAddr's doc
+	// comments in network.go: proxyAddr's literal host is never actually
+	// reachable from inside a sandbox's network namespace, confirmed
+	// empirically during this work.
+	b := &BwrapIsolator{proxyAddr: "127.0.0.1:18080"}
+	args := b.buildArgs(LaunchSpec{Cmd: []string{"/bin/true"}})
+	got := map[string]string{}
+	for i, a := range args {
+		if a == "--setenv" && i+2 < len(args) {
+			got[args[i+1]] = args[i+2]
+		}
+	}
+	const want = "http://10.0.2.2:18080"
+	for _, k := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
+		if got[k] != want {
+			t.Errorf("%s = %q, want %q", k, got[k], want)
+		}
+	}
+}
+
+func TestBuildArgs_ProfileEnvOverridesDefaultProxy(t *testing.T) {
+	b := &BwrapIsolator{proxyAddr: "127.0.0.1:18080"}
+	args := b.buildArgs(LaunchSpec{
+		Env: map[string]string{"HTTP_PROXY": "http://custom:9999"},
+		Cmd: []string{"/bin/true"},
+	})
+	for i, a := range args {
+		if a == "--setenv" && args[i+1] == "HTTP_PROXY" {
+			if args[i+2] != "http://custom:9999" {
+				t.Errorf("HTTP_PROXY = %q, want the profile's override to win", args[i+2])
+			}
+			return
+		}
+	}
+	t.Fatal("HTTP_PROXY not found in args")
 }
 
 func TestBuildArgs_UnshareFlagsAndScaffolding(t *testing.T) {
@@ -135,7 +188,7 @@ func TestNewBwrapIsolator_MissingFromPATH(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("PATH", dir) // a PATH with nothing on it
 
-	_, err := NewBwrapIsolator()
+	_, err := NewBwrapIsolator("127.0.0.1:18080")
 	if err == nil {
 		t.Fatal("expected an error when bwrap is not on PATH")
 	}
@@ -154,7 +207,7 @@ func TestNewBwrapIsolator_FoundButUserNamespacesUnavailable(t *testing.T) {
 	}
 	t.Setenv("PATH", dir)
 
-	_, err := NewBwrapIsolator()
+	_, err := NewBwrapIsolator("127.0.0.1:18080")
 	if err == nil {
 		t.Fatal("expected an error when the bwrap smoke test fails")
 	}

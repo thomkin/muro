@@ -19,6 +19,32 @@ type ProxyUpdater interface {
 	// SetAllowlist hot-swaps the allowlist ruleset for one sandbox
 	// (DESIGN.md §6.3/§9) — always live, no restart ever required.
 	SetAllowlist(sandboxID string, allowURLs []string)
+
+	// RegisterSandboxAddr records that a sandbox's bridged network address
+	// (Stage 2 networking — internal/sandbox/network.go) belongs to
+	// sandboxID, so the proxy can identify inbound connections by source
+	// address. Called after every Launch whose Handle exposes one (real
+	// bwrap-launched sandboxes always do; a FakeIsolator in tests need
+	// not).
+	RegisterSandboxAddr(sandboxID, addr string)
+}
+
+// registerHandleNetworkAddr tells proxy which address h's sandbox is
+// bridged through, if any — h implementing networkAddrProvider is a Go
+// "optional interface" check (network.go), not every Isolator provides
+// real networking (test fakes don't), so a miss here is expected and
+// silently skipped, not an error.
+func registerHandleNetworkAddr(proxy ProxyUpdater, sandboxID string, h Handle) {
+	if proxy == nil {
+		return
+	}
+	np, ok := h.(networkAddrProvider)
+	if !ok {
+		return
+	}
+	if addr := np.NetworkAddr(); addr != "" {
+		proxy.RegisterSandboxAddr(sandboxID, addr)
+	}
 }
 
 // EventPublisher is the minimal surface Manager needs from the pub/sub
@@ -217,6 +243,7 @@ func (m *Manager) Run(profile *config.Profile, name, namespace string) (*state.S
 
 	if m.proxy != nil {
 		m.proxy.SetAllowlist(sb.ID, sb.AllowURLs)
+		registerHandleNetworkAddr(m.proxy, sb.ID, handle)
 	}
 	if m.publisher != nil {
 		_ = m.publisher.PublishStatus(namespace, name, "started")
@@ -393,6 +420,12 @@ func (m *Manager) Restart(namespace, name string) error {
 		return err
 	}
 
+	// A restart gets a brand-new bwrap process, hence a brand-new Stage 2
+	// network bridge and outbound address — re-register it even though the
+	// allowlist rule itself (keyed by the stable sb.ID, not the address)
+	// doesn't need re-setting.
+	registerHandleNetworkAddr(m.proxy, sb.ID, handle)
+
 	epoch := m.setHandle(key, handle)
 	if m.publisher != nil {
 		_ = m.publisher.PublishStatus(namespace, name, "restarted")
@@ -523,6 +556,7 @@ func (m *Manager) watchLoop(namespace, name string, h Handle, epoch int) {
 		sb.State = state.StateRunning
 		running := sb
 		_ = m.store.Put(&running)
+		registerHandleNetworkAddr(m.proxy, sb.ID, newHandle) // new process, new Stage 2 bridge/address
 		if m.publisher != nil {
 			_ = m.publisher.PublishStatus(namespace, name, "restarted")
 		}
