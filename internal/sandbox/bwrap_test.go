@@ -82,7 +82,7 @@ func TestBuildArgs_UnshareFlagsAndScaffolding(t *testing.T) {
 	b := &BwrapIsolator{}
 	args := b.buildArgs(LaunchSpec{Cmd: []string{"/bin/true"}})
 	for _, want := range []string{
-		"--unshare-user", "--unshare-pid", "--unshare-net", "--die-with-parent",
+		"--unshare-user", "--unshare-pid", "--unshare-net",
 	} {
 		found := false
 		for _, a := range args {
@@ -97,6 +97,22 @@ func TestBuildArgs_UnshareFlagsAndScaffolding(t *testing.T) {
 	}
 	if !containsSeq(args, "--proc", "/proc") || !containsSeq(args, "--dev", "/dev") || !containsSeq(args, "--tmpfs", "/tmp") {
 		t.Errorf("expected minimal scaffolding (--proc /proc --dev /dev --tmpfs /tmp), got %v", args)
+	}
+}
+
+// TestBuildArgs_NeverDieWithParent guards against a real bug found via a
+// live end-to-end test: --die-with-parent kills the sandboxed process the
+// instant murod itself exits — including a clean shutdown/restart, not
+// just a crash — which directly contradicts the requirement (cmd/murod,
+// IMPLEMENTATION.md §6) that only `muro sandbox stop` may stop a running
+// sandbox. A daemon restart must never take a sandbox down with it.
+func TestBuildArgs_NeverDieWithParent(t *testing.T) {
+	b := &BwrapIsolator{}
+	args := b.buildArgs(LaunchSpec{Cmd: []string{"/bin/true"}})
+	for _, a := range args {
+		if a == "--die-with-parent" {
+			t.Fatal("--die-with-parent must never be passed to bwrap — it kills a running sandbox when murod exits, even on a clean shutdown")
+		}
 	}
 }
 

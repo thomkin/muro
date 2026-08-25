@@ -79,7 +79,15 @@ func (b *BwrapIsolator) buildArgs(spec LaunchSpec) []string {
 		"--unshare-uts",
 		"--unshare-cgroup",
 		"--unshare-net",
-		"--die-with-parent",
+		// Deliberately NOT --die-with-parent: that flag kills the sandboxed
+		// process the instant its parent (murod, via os/exec) exits — which
+		// includes a clean `murod` shutdown/restart, not just a crash.
+		// IMPLEMENTATION.md §6 and cmd/murod's shutdown handler are explicit
+		// that a daemon restart must never kill an already-running sandbox
+		// (only `muro sandbox stop` should); state.Reconcile already handles
+		// re-adopting a still-alive sandbox by PID on murod's next startup.
+		// A real end-to-end test (SIGTERM'ing murod while a sandbox was
+		// still running) caught this flag doing exactly that.
 		"--proc", "/proc",
 		"--dev", "/dev",
 		"--tmpfs", "/tmp",
@@ -135,9 +143,34 @@ func (b *BwrapIsolator) Launch(ctx context.Context, spec LaunchSpec) (Handle, er
 		cmd.Stdout = pts
 		cmd.Stderr = pts
 		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Setsid:  true,
-			Setctty: true,
-			Ctty:    0, // fd 0 in the child, i.e. stdin — which is pts
+			Setsid: true,
+			// Deliberately NOT Setctty: making pts the sandboxed process's
+			// controlling terminal ties its survival to murod's own
+			// process lifetime, not just bwrap's --die-with-parent (which
+			// is already omitted, see buildArgs). murod holds the pty
+			// MASTER (ptmx) in its own fd table for the sandbox's whole
+			// life, so when murod exits, the kernel closes ptmx — and
+			// losing a controlling terminal's master delivers SIGHUP to
+			// its session, killing the sandbox. This is standard tty
+			// semantics (the same thing that kills a shell when its
+			// terminal window closes), not a bwrap quirk, and it directly
+			// broke the "a daemon restart must not kill a running sandbox"
+			// requirement (IMPLEMENTATION.md §6) — found via a real
+			// end-to-end SIGTERM test. Without Setctty, stdin/stdout/
+			// stderr are still the pty slave (raw-mode I/O for attach
+			// still works), just not the session's controlling terminal,
+			// so losing the master doesn't hang it up. Tradeoff: kernel-
+			// generated job-control signals from special tty characters
+			// (e.g. a raw Ctrl-C auto-becoming SIGINT) no longer happen —
+			// acceptable here since muro sandbox attach's client side
+			// already puts the local terminal in raw mode and forwards
+			// bytes untouched (internal/cli/attach.go), never relying on
+			// local kernel signal generation either. A pty master that
+			// survives a daemon restart (the tmux/screen-style fix — a
+			// small long-lived per-sandbox helper process murod
+			// reconnects to across restarts) is a real, separate
+			// architectural piece worth deliberate design attention later,
+			// not invented unreviewed here.
 		}
 		if err := cmd.Start(); err != nil {
 			ptmx.Close()
