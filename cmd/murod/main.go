@@ -37,13 +37,13 @@ func run() int {
 
 	cfg := loadDaemonConfig(logger)
 
-	store, err := openStateStore(logger)
+	store, stateDir, err := openStateStore(logger)
 	if err != nil {
 		logger.Error("open state store", "error", err)
 		return 1
 	}
 
-	isolator, err := sandbox.NewBwrapIsolator(proxyListenAddr)
+	isolator, err := sandbox.NewBwrapIsolator(proxyListenAddr, stateDir)
 	if err != nil {
 		logger.Error("sandbox isolation unavailable", "error", err)
 		return 1
@@ -65,6 +65,19 @@ func run() int {
 	}
 
 	mgr := sandbox.NewManager(store, isolator, proxySrv, publisher)
+
+	// Reconnect to whatever survived from a previous murod process — real
+	// only since shim.go/cmd/muro-shim exists: a sandbox's shim (and
+	// therefore the sandboxed process itself) outlives a clean murod
+	// restart, so state.Reconcile (above, inside openStateStore) may have
+	// left sandboxes genuinely still StateRunning that this fresh Manager
+	// has no live Handle for yet. This does NOT resume restart_policy
+	// watching for them (a separate, explicitly out-of-scope piece) — it
+	// only restores enough for `muro sandbox attach`/`stop` to keep
+	// working against them.
+	for _, reattachErr := range mgr.ReattachAll() {
+		logger.Warn("could not reattach a surviving sandbox", "error", reattachErr)
+	}
 
 	controlSrv := control.NewServer(mgr, store, brokerChecker)
 
@@ -113,22 +126,26 @@ func loadDaemonConfig(logger *slog.Logger) *config.DaemonConfig {
 	return cfg
 }
 
-func openStateStore(logger *slog.Logger) (*state.Store, error) {
+// openStateStore also returns the resolved state directory itself (not
+// just the store built from state.json inside it) — BwrapIsolator needs
+// it too, to lay out each sandbox's shim runtime directory
+// (internal/sandbox/bwrap.go's Launch: stateDir/sandboxes/<id>/).
+func openStateStore(logger *slog.Logger) (*state.Store, string, error) {
 	stateDir, err := config.StateDir()
 	if err != nil {
-		return nil, fmt.Errorf("resolve state dir: %w", err)
+		return nil, "", fmt.Errorf("resolve state dir: %w", err)
 	}
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		return nil, fmt.Errorf("create state dir: %w", err)
+		return nil, "", fmt.Errorf("create state dir: %w", err)
 	}
 	store := state.NewStore(filepath.Join(stateDir, "state.json"))
 	if err := store.Load(); err != nil {
-		return nil, fmt.Errorf("load state.json: %w", err)
+		return nil, "", fmt.Errorf("load state.json: %w", err)
 	}
 	if err := state.Reconcile(store); err != nil {
 		logger.Warn("startup reconciliation had errors", "error", err)
 	}
-	return store, nil
+	return store, stateDir, nil
 }
 
 // connectPubSub tries to connect to the configured MQTT broker. A failed

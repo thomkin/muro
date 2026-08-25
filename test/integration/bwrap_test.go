@@ -53,7 +53,7 @@ const testProxyAddr = "127.0.0.1:18080"
 
 func newIsolator(t *testing.T) *sandbox.BwrapIsolator {
 	t.Helper()
-	iso, err := sandbox.NewBwrapIsolator(testProxyAddr)
+	iso, err := sandbox.NewBwrapIsolator(testProxyAddr, t.TempDir())
 	if err != nil {
 		t.Skipf("bwrap isolator unavailable, skipping integration test: %v", err)
 	}
@@ -299,14 +299,28 @@ func TestPTY_LaunchProducesUsablePseudoTerminal(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	// Deliberately not a one-shot `echo` and exit: since PTY:true launches
+	// go through muro-shim's socket now (its whole reason to exist — the
+	// pty master must survive a murod restart, shim.go), a sandbox that
+	// finishes before this test even calls Stdio() would race against
+	// Launch's own post-launch network bridge setup (which takes
+	// noticeably longer than an instant echo) and could legitimately have
+	// already exited and torn down its socket by the time Stdio() runs.
+	// That's not a bug to work around here (retrying the dial would only
+	// mask it, at real latency cost, for a scenario — attaching to a
+	// process that's already gone — nothing realistic does; an attach
+	// target is by nature long-lived). A brief sleep after the echo keeps
+	// this test's actual assertion (PTY output really is readable through
+	// the shim) representative of how attach is actually used.
 	h, err := iso.Launch(ctx, sandbox.LaunchSpec{
 		Mounts: shellMounts(),
-		Cmd:    []string{"/bin/sh", "-c", "echo pty-hello"},
+		Cmd:    []string{"/bin/sh", "-c", "echo pty-hello; sleep 2"},
 		PTY:    true,
 	})
 	if err != nil {
 		t.Fatalf("Launch with PTY: %v", err)
 	}
+	defer iso.Stop(h)
 
 	pty, ok := h.Stdio()
 	if !ok {
@@ -314,7 +328,13 @@ func TestPTY_LaunchProducesUsablePseudoTerminal(t *testing.T) {
 	}
 
 	buf := make([]byte, 256)
-	pty.SetReadDeadline(time.Now().Add(5 * time.Second))
+	// Stdio() only promises io.ReadWriteCloser (a real bwrap-launched
+	// sandbox's is a *net.UnixConn dialed to its shim's socket, which does
+	// support deadlines — internal/sandbox/isolator.go's doc comment on
+	// why the interface itself doesn't guarantee this).
+	if deadliner, ok := pty.(interface{ SetReadDeadline(time.Time) error }); ok {
+		_ = deadliner.SetReadDeadline(time.Now().Add(5 * time.Second))
+	}
 	n, err := pty.Read(buf)
 	if err != nil && err != io.EOF {
 		t.Fatalf("read from pty: %v", err)

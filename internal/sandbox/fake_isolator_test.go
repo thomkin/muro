@@ -2,7 +2,7 @@ package sandbox
 
 import (
 	"context"
-	"os"
+	"io"
 	"sync"
 
 	"github.com/thomkin/muro/internal/config"
@@ -95,7 +95,7 @@ func (h *fakeHandle) Wait() (int, error) {
 	return h.exitCode, h.exitErr
 }
 
-func (h *fakeHandle) Stdio() (*os.File, bool) {
+func (h *fakeHandle) Stdio() (io.ReadWriteCloser, bool) {
 	// No real pty backs a fakeHandle; attach-exclusivity tests only need
 	// Attach to succeed in claiming the slot, not a working terminal.
 	return nil, true

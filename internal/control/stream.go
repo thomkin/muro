@@ -3,6 +3,7 @@ package control
 import (
 	"bufio"
 	"encoding/json"
+	"io"
 	"net"
 	"os"
 	"time"
@@ -65,16 +66,29 @@ func (s *Server) handleAttach(conn net.Conn, r *bufio.Reader, req Request) {
 	}
 }
 
+// deadlineSetter is the optional capability pty (an io.ReadWriteCloser —
+// Handle.Stdio() no longer promises a real *os.File now that it dials a
+// shim process's Unix socket rather than holding an in-process pty fd,
+// internal/sandbox/isolator.go) may additionally support. net.Conn always
+// does; pumpPtyToConn checks for it via a type assertion rather than
+// requiring it, the same "optional interface" idiom
+// internal/sandbox/network.go uses for networkAddrProvider.
+type deadlineSetter interface {
+	SetReadDeadline(time.Time) error
+}
+
 // pumpPtyToConn relays sandbox output (pty) to the client (conn) until
 // done is closed or the pty/connection errors. It polls via a short read
 // deadline so it notices done being closed promptly rather than blocking
-// forever in Read — if the underlying file doesn't support deadlines (not
-// all *os.File values do), it falls back to a plain blocking Read, which
-// still exits correctly once the pty itself closes (sandbox stop/exit),
-// just not promptly on a mid-session detach.
-func pumpPtyToConn(pty *os.File, conn net.Conn, done <-chan struct{}) {
+// forever in Read — if pty doesn't support deadlines, it falls back to a
+// plain blocking Read, which still exits correctly once the pty itself
+// closes (sandbox stop/exit), just not promptly on a mid-session detach.
+func pumpPtyToConn(pty io.ReadWriteCloser, conn net.Conn, done <-chan struct{}) {
 	buf := make([]byte, 4096)
-	supportsDeadline := pty.SetReadDeadline(time.Now().Add(200*time.Millisecond)) == nil
+	deadliner, supportsDeadline := pty.(deadlineSetter)
+	if supportsDeadline {
+		supportsDeadline = deadliner.SetReadDeadline(time.Now().Add(200*time.Millisecond)) == nil
+	}
 	for {
 		select {
 		case <-done:
@@ -82,7 +96,7 @@ func pumpPtyToConn(pty *os.File, conn net.Conn, done <-chan struct{}) {
 		default:
 		}
 		if supportsDeadline {
-			_ = pty.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+			_ = deadliner.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 		}
 		n, err := pty.Read(buf)
 		if n > 0 {

@@ -461,8 +461,15 @@ restart_backoff_cap: 5
 
 ## 9. Makefile
 
+*Updated during implementation: a fourth binary, `muro-shim`, was added —
+see DESIGN.md §4 for why (a persistent per-sandbox pty holder, needed once
+it became clear `murod` itself holding a sandbox's pty meant every sandbox
+died on a daemon restart). This plan's package-by-package breakdown below
+predates that discovery and describes the original three-binary shape; the
+Makefile snippet is kept current since it's copy-pasteable.*
+
 ```makefile
-BINARIES := muro murod muro-broker
+BINARIES := muro murod muro-broker muro-shim
 
 .PHONY: build test test-integration lint clean install
 

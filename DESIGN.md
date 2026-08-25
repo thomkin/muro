@@ -12,11 +12,11 @@ still open and why.
 - Rationale: every implementation detail already sketched in SPEC.md assumes
   Go (`x/sys/unix` for namespaces, Go MQTT clients, "single static Go
   binary"). No polyglot components.
-- Build: `CGO_ENABLED=0` for all three binaries — every chosen dependency
+- Build: `CGO_ENABLED=0` for all four binaries — every chosen dependency
   (below) is pure Go, so static, fully self-contained binaries are the
   default build mode, not a stretch goal.
-- Module layout: single Go module, single repo, three `cmd/` entrypoints
-  (§4).
+- Module layout: single Go module, single repo, four `cmd/` entrypoints
+  (§4) — a fourth, `muro-shim`, was added during implementation; see §4.
 
 ## 2. Project License
 
@@ -47,7 +47,10 @@ SQLite was dropped from SPEC.md §7's original state-store sketch).
 
 ## 4. Binaries
 
-Three separate binaries, one release, one repo:
+Four separate binaries, one release, one repo — a fourth, `muro-shim`, was
+added during implementation (not in the original design pass) once it
+became clear `murod` holding a sandbox's pty directly meant every sandbox
+died the instant `murod` exited, even on a clean restart:
 
 - **`muro`** — the CLI client. Talks only to `murod`'s control socket. No
   root/CAP_* requirements; can run as the invoking user.
@@ -61,14 +64,28 @@ Three separate binaries, one release, one repo:
   connects `murod` to a `muro-broker` on `localhost` (dev) or a self-hosted
   `muro-broker` on a remote host (production) — no branch in `murod` for
   "local vs. remote broker."
+- **`muro-shim`** — a persistent per-sandbox pty holder, spawned by
+  `BwrapIsolator.Launch` instead of `murod` exec'ing `bwrap` directly (the
+  `containerd-shim`/`dtach` pattern). It allocates the pty, execs `bwrap` as
+  its own child, and stays alive independent of `murod`'s process
+  lifetime — relaying the pty over a per-sandbox Unix socket that `murod`
+  (or a *restarted* `murod`, reconstructing a `Handle` from `state.json`)
+  dials for `muro sandbox attach`. Its own lifetime is tied to the
+  sandboxed process's, not `murod`'s: it exits shortly after its child
+  does. Never invoked directly by an operator — an implementation detail of
+  `BwrapIsolator`, the same way an operator never invokes `bwrap` directly
+  either.
 
 ```
 cmd/
   muro/       -> muro CLI binary
   murod/      -> murod daemon binary
   muro-broker/-> muro-broker binary (mochi-mqtt wrapper)
+  muro-shim/  -> muro-shim binary (persistent per-sandbox pty holder)
 internal/
   sandbox/    -> Sandbox Manager, Isolator interface + bwrap implementation
+                 (bwrap.go spawns muro-shim; shim.go is the wire protocol
+                 both BwrapIsolator and cmd/muro-shim speak)
   proxy/      -> URL-allowlist HTTP/CONNECT proxy
   control/    -> Unix-socket control API (server side, used by murod;
                  client side, used by muro)
@@ -488,7 +505,8 @@ Resolved by this document (SPEC.md §10 items, in original numbering):
    `murod` is already the sole enforcement point (§13).
 5. **TLS-terminating proxy mode** — decided against permanently; see item
    14 below.
-6. **Packaging/distribution** — three static Go binaries + systemd units +
+6. **Packaging/distribution** — four static Go binaries (a fourth,
+   `muro-shim`, added during implementation — §4) + systemd units +
    install script, same repo/release (§4, §8).
 7. **Cross-daemon name collisions** — reject on broker-visible collision,
    via a retained claim topic per `namespace/name` correlated against a

@@ -82,7 +82,7 @@ func (a *outboundAddrAllocator) allocate() string {
 	return addr
 }
 
-// errSandboxAlreadyExited is returned by innerNamespacePID when the outer
+// errSandboxAlreadyExited is returned by InnerNamespacePID when the outer
 // bwrap process (and therefore necessarily its whole tree) has already
 // exited by the time this looked for it — a fast, legitimate command (e.g.
 // `test -f ...`, `echo hi`) can complete before Launch's network setup
@@ -95,7 +95,7 @@ func (a *outboundAddrAllocator) allocate() string {
 // was handled as a distinct case from a genuinely stuck bridge attempt.
 var errSandboxAlreadyExited = errors.New("sandbox process already exited before network setup ran")
 
-// innerNamespacePID discovers the PID that actually owns the sandbox's new
+// InnerNamespacePID discovers the PID that actually owns the sandbox's new
 // namespaces. bwrap's outer process (the one os/exec starts) performs
 // initial setup in the CALLER's namespaces and only forks+unshares into the
 // new user/pid/net/ipc/uts namespaces in a child, which becomes PID 1 of
@@ -122,7 +122,7 @@ var errSandboxAlreadyExited = errors.New("sandbox process already exited before 
 // treating "outer alive, no child yet" as an error, distinct from "outer
 // already gone," caused this exact false-positive failure against real
 // fast-exiting sandboxes in test/integration/bwrap_test.go.
-func innerNamespacePID(outerPID int) (int, error) {
+func InnerNamespacePID(outerPID int) (int, error) {
 	childrenPath := fmt.Sprintf("/proc/%d/task/%d/children", outerPID, outerPID)
 	// Short: real detection (when there's anything left to detect) is a
 	// sub-millisecond /proc read, so this only ever actually elapses for
@@ -169,8 +169,25 @@ type networkBridge struct {
 // facility for; this function does the necessary setup as fast as
 // reasonably possible, which is the documented, accepted v1 limit rather
 // than a true barrier.
+//
+// The window widened once bwrap moved behind muro-shim (shim.go): Launch
+// now waits out an extra process spawn + ready-fd round trip before this
+// function even starts, giving a fast one-shot command (`test -f ...`)
+// more time to finish and be reaped before InnerNamespacePID's initial
+// poll runs. That part was already handled — but the SAME race can now
+// also land a moment LATER, between InnerNamespacePID succeeding and
+// slirp4netns/nft actually executing against the PID it found; confirmed
+// empirically (nsenter: "cannot open /proc/<pid>/ns/user: No such file or
+// directory" against fast integration-test commands after the shim
+// change). Both slirp4netns and applyEgressRestriction failures are
+// therefore re-checked against isAlivePID before being treated as a real
+// error — a genuine tool failure against a still-alive target is
+// reported normally; a failure against a target that's simply gone by
+// now is the identical "nothing to bridge, launch still succeeds" case
+// InnerNamespacePID's own doc comment already describes, not a new kind
+// of failure.
 func setupNetworkBridge(outerPID int, outboundAddr, proxyAddr string) (*networkBridge, error) {
-	innerPID, err := innerNamespacePID(outerPID)
+	innerPID, err := InnerNamespacePID(outerPID)
 	if errors.Is(err, errSandboxAlreadyExited) {
 		return nil, errSandboxAlreadyExited // propagated as-is; Launch treats this specially
 	}
@@ -180,11 +197,17 @@ func setupNetworkBridge(outerPID int, outboundAddr, proxyAddr string) (*networkB
 
 	slirpCmd, err := startSlirp4netns(innerPID, outboundAddr)
 	if err != nil {
+		if !isAlivePID(innerPID) {
+			return nil, errSandboxAlreadyExited
+		}
 		return nil, fmt.Errorf("bridge sandbox network (slirp4netns): %w", err)
 	}
 
 	if err := applyEgressRestriction(innerPID, proxyAddr); err != nil {
 		_ = stopSlirp4netns(slirpCmd)
+		if !isAlivePID(innerPID) {
+			return nil, errSandboxAlreadyExited
+		}
 		return nil, fmt.Errorf("restrict sandbox egress (nft): %w", err)
 	}
 
@@ -274,6 +297,45 @@ func startSlirp4netns(innerPID int, outboundAddr string) (*exec.Cmd, error) {
 	}
 
 	return cmd, nil
+}
+
+// pid returns the slirp4netns process's PID, or 0 if there is none (nb is
+// nil, or Launch never got as far as starting it). Manager persists this
+// into state.Sandbox.SlirpPID so a Handle reconstructed after a murod
+// restart (shim.go) can still tear the bridge down by PID even though it
+// was never that bridge's parent process.
+func (nb *networkBridge) pid() int {
+	if nb == nil || nb.slirpCmd == nil || nb.slirpCmd.Process == nil {
+		return 0
+	}
+	return nb.slirpCmd.Process.Pid
+}
+
+// stopSlirpByPID tears down a slirp4netns process this Go process is NOT
+// the parent of — the case after a murod restart, reconstructing a Handle
+// for a sandbox whose bridge was started by the PREVIOUS murod process.
+// os.Process.Wait only works for an actual child, so unlike
+// stopSlirp4netns (which owns a live *exec.Cmd and can just Wait it),
+// this polls PID liveness instead of blocking on wait4(2).
+func stopSlirpByPID(pid int) {
+	if pid <= 0 {
+		return
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return
+	}
+	if err := proc.Signal(syscall.SIGTERM); err != nil {
+		return // already gone
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !isAlivePID(pid) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	_ = proc.Signal(syscall.SIGKILL)
 }
 
 func stopSlirp4netns(cmd *exec.Cmd) error {

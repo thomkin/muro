@@ -38,6 +38,21 @@ type Sandbox struct {
 	AllowURLs     []string       `json:"allow_urls"`
 	RestartPolicy string         `json:"restart_policy"`
 	RestartCount  int            `json:"restart_count"`
+
+	// ShimSocket, NetAddr, and SlirpPID let a restarted murod reconstruct
+	// a live Handle for a sandbox it didn't itself launch (Stage 3 shim
+	// lifecycle, internal/sandbox/shim.go) — PID alone is only enough to
+	// check liveness (state.Reconcile), not to re-attach or correctly
+	// tear the sandbox's network bridge down. ShimSocket is the Unix
+	// socket path the sandbox's persistent shim process listens on for
+	// attach; NetAddr is its bridged outbound loopback address
+	// (internal/sandbox/network.go); SlirpPID is its slirp4netns bridge
+	// process's PID, needed because a reconstructed Handle was never that
+	// process's parent and so has no wait4(2)-based way to manage it,
+	// only signal-by-PID.
+	ShimSocket string `json:"shim_socket,omitempty"`
+	NetAddr    string `json:"net_addr,omitempty"`
+	SlirpPID   int    `json:"slirp_pid,omitempty"`
 }
 
 // Clone returns a deep copy of sb — a shallow struct copy would still share

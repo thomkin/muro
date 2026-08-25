@@ -117,7 +117,7 @@ timeout 2 sh -c 'exec 3<>/dev/tcp/10.0.2.2/18080 && printf "GET %s HTTP/1.0\r\nH
 // /work, waits for it to finish, and returns the content of workDir/out.
 func runScriptAndReadFile(t *testing.T, cmd []string, workDir string) string {
 	t.Helper()
-	iso, err := sandbox.NewBwrapIsolator(testProxyAddr)
+	iso, err := sandbox.NewBwrapIsolator(testProxyAddr, t.TempDir())
 	if err != nil {
 		t.Skipf("bwrap isolator unavailable, skipping: %v", err)
 	}

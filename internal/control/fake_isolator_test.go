@@ -2,6 +2,7 @@ package control
 
 import (
 	"context"
+	"io"
 	"os"
 	"sync"
 	"syscall"
@@ -35,9 +36,9 @@ type fakeHandle struct {
 	peer *os.File
 }
 
-func (h *fakeHandle) PID() int                { return h.pid }
-func (h *fakeHandle) Wait() (int, error)      { return <-h.exitCh, nil }
-func (h *fakeHandle) Stdio() (*os.File, bool) { return h.pty, h.pty != nil }
+func (h *fakeHandle) PID() int                          { return h.pid }
+func (h *fakeHandle) Wait() (int, error)                { return <-h.exitCh, nil }
+func (h *fakeHandle) Stdio() (io.ReadWriteCloser, bool) { return h.pty, h.pty != nil }
 
 func newFakeHandle(pid int, withPTY bool) (*fakeHandle, error) {
 	h := &fakeHandle{pid: pid, exitCh: make(chan int, 1)}

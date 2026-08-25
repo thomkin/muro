@@ -188,7 +188,7 @@ func TestNewBwrapIsolator_MissingFromPATH(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("PATH", dir) // a PATH with nothing on it
 
-	_, err := NewBwrapIsolator("127.0.0.1:18080")
+	_, err := NewBwrapIsolator("127.0.0.1:18080", t.TempDir())
 	if err == nil {
 		t.Fatal("expected an error when bwrap is not on PATH")
 	}
@@ -207,7 +207,7 @@ func TestNewBwrapIsolator_FoundButUserNamespacesUnavailable(t *testing.T) {
 	}
 	t.Setenv("PATH", dir)
 
-	_, err := NewBwrapIsolator("127.0.0.1:18080")
+	_, err := NewBwrapIsolator("127.0.0.1:18080", t.TempDir())
 	if err == nil {
 		t.Fatal("expected an error when the bwrap smoke test fails")
 	}

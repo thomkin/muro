@@ -3,7 +3,7 @@ package sandbox
 import (
 	"context"
 	"fmt"
-	"os"
+	"io"
 	"sync"
 	"time"
 
@@ -45,6 +45,92 @@ func registerHandleNetworkAddr(proxy ProxyUpdater, sandboxID string, h Handle) {
 	if addr := np.NetworkAddr(); addr != "" {
 		proxy.RegisterSandboxAddr(sandboxID, addr)
 	}
+}
+
+// shimRuntimeInfo is an optional capability a Handle may implement to
+// expose where its persistent shim process's runtime files live (Stage 3
+// lifecycle, shim.go/bwrap.go) — real bwrap-launched sandboxes always do,
+// a FakeIsolator's test handles don't need to. Manager persists both
+// values into state.Sandbox so a restarted murod can reconstruct a Handle
+// (Reattach, below) for an already-running sandbox without needing to
+// still be its shim's parent process. Same "optional interface" idiom as
+// networkAddrProvider (network.go).
+type shimRuntimeInfo interface {
+	ShimSocket() string
+	SlirpPID() int
+}
+
+// captureHandleInfo copies whatever PID.md/networking/shim-runtime info h
+// exposes into sb, ready for store.Put — every Launch call site (Run,
+// Restart, watchLoop's relaunch) needs exactly this, so it's centralized
+// here rather than tripled inline.
+func captureHandleInfo(sb *state.Sandbox, h Handle) {
+	sb.PID = h.PID()
+	if np, ok := h.(networkAddrProvider); ok {
+		sb.NetAddr = np.NetworkAddr()
+	}
+	if si, ok := h.(shimRuntimeInfo); ok {
+		sb.ShimSocket = si.ShimSocket()
+		sb.SlirpPID = si.SlirpPID()
+	}
+}
+
+// Reattacher is an optional capability an Isolator may implement to
+// reconstruct a Handle for a sandbox process it didn't itself just Launch
+// — the case right after a murod restart, once state.Reconcile has
+// confirmed the persisted PID is still alive. BwrapIsolator implements
+// this (bwrap.go); a test fake has no equivalent concept and simply
+// doesn't implement it, which Manager.Reattach reports as a clear error
+// rather than requiring every Isolator to support it.
+type Reattacher interface {
+	Reattach(pid int, shimSocket string, slirpPID int, netAddr string) (Handle, error)
+}
+
+// Reattach reconstructs a live Handle for sb, whose process
+// state.Reconcile has already confirmed survived from a previous murod
+// process, and registers it exactly as Run would (proxy allowlist +
+// network address). It deliberately does NOT start a watchLoop —
+// resuming restart_policy tracking across a daemon restart is a separate,
+// explicitly out-of-scope piece (shim.go's design note); this exists
+// solely so `muro sandbox attach`/`stop` keep working against a sandbox
+// that outlived the murod process that originally launched it.
+func (m *Manager) Reattach(sb *state.Sandbox) error {
+	ra, ok := m.isolator.(Reattacher)
+	if !ok {
+		return fmt.Errorf("isolator does not support reattaching to an already-running sandbox")
+	}
+	h, err := ra.Reattach(sb.PID, sb.ShimSocket, sb.SlirpPID, sb.NetAddr)
+	if err != nil {
+		return fmt.Errorf("reattach sandbox %s/%s: %w", sb.Namespace, sb.Name, err)
+	}
+	m.setHandle(mapKey(sb.Namespace, sb.Name), h)
+	if m.proxy != nil {
+		m.proxy.SetAllowlist(sb.ID, sb.AllowURLs)
+		if sb.NetAddr != "" {
+			m.proxy.RegisterSandboxAddr(sb.ID, sb.NetAddr)
+		}
+	}
+	return nil
+}
+
+// ReattachAll calls Reattach for every sandbox the Store currently has
+// marked StateRunning — meant to be called once at murod startup, after
+// state.Reconcile has already downgraded anything that didn't actually
+// survive. Errors for individual sandboxes are collected, not fatal to
+// the whole pass: one unreattachable sandbox (e.g. its shim genuinely
+// died in the gap between Reconcile and this call) shouldn't block every
+// other one from coming back under murod's management.
+func (m *Manager) ReattachAll() []error {
+	var errs []error
+	for _, sb := range m.store.List("") {
+		if sb.State != state.StateRunning {
+			continue
+		}
+		if err := m.Reattach(sb); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errs
 }
 
 // EventPublisher is the minimal surface Manager needs from the pub/sub
@@ -143,11 +229,12 @@ func (m *Manager) buildLaunchSpec(sb *state.Sandbox, env map[string]string) Laun
 		cmd = []string{"/bin/sh"} // fallback; real agent command construction is a later (bwrap/cmd) concern
 	}
 	return LaunchSpec{
-		Mounts: sb.Mounts,
-		Tools:  sb.Tools,
-		Env:    env,
-		Cmd:    cmd,
-		PTY:    true,
+		SandboxID: sb.ID,
+		Mounts:    sb.Mounts,
+		Tools:     sb.Tools,
+		Env:       env,
+		Cmd:       cmd,
+		PTY:       true,
 	}
 }
 
@@ -231,7 +318,7 @@ func (m *Manager) Run(profile *config.Profile, name, namespace string) (*state.S
 	if err != nil {
 		return nil, fmt.Errorf("launch sandbox %s/%s: %w", namespace, name, err)
 	}
-	sb.PID = handle.PID()
+	captureHandleInfo(sb, handle)
 
 	if err := m.store.Put(sb); err != nil {
 		_ = m.isolator.Stop(handle)
@@ -414,7 +501,7 @@ func (m *Manager) Restart(namespace, name string) error {
 		return fmt.Errorf("restart sandbox %s/%s: %w", namespace, name, err)
 	}
 
-	sb.PID = handle.PID()
+	captureHandleInfo(&sb, handle)
 	sb.State = state.StateRunning
 	if err := m.store.Put(&sb); err != nil {
 		return err
@@ -469,7 +556,7 @@ func (m *Manager) Stop(namespace, name string) error {
 // Attach claims exclusive interactive access to a running sandbox's pty
 // (DESIGN.md §12). The returned detach func must be called when the
 // caller is done (or the terminal disconnects) to release the slot.
-func (m *Manager) Attach(namespace, name string) (*os.File, func(), error) {
+func (m *Manager) Attach(namespace, name string) (io.ReadWriteCloser, func(), error) {
 	sb, ok := m.store.Get(namespace, name)
 	if !ok {
 		return nil, nil, fmt.Errorf("sandbox %s/%s not found", namespace, name)
@@ -552,7 +639,7 @@ func (m *Manager) watchLoop(namespace, name string, h Handle, epoch int) {
 			return
 		}
 
-		sb.PID = newHandle.PID()
+		captureHandleInfo(&sb, newHandle)
 		sb.State = state.StateRunning
 		running := sb
 		_ = m.store.Put(&running)
