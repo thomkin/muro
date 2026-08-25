@@ -441,11 +441,24 @@ instance is already retained there, the launch is rejected outright with
 `namespace/name already claimed by daemon <id> since <time>`, rather than
 starting a second sandbox that would collide once both daemons reach the
 same broker. Stale claims (a daemon that crashed without cleanly stopping
-its sandboxes) are handled with MQTT's native **Last Will and Testament**:
-each `murod` registers an LWT on connect that clears all of its own claim
-topics if it disconnects uncleanly, so a crashed daemon's claims don't
-permanently block the name — this reuses broker-native semantics instead of
-inventing a custom reservation protocol.
+its sandboxes) are handled with MQTT's native **Last Will and Testament** —
+**correction, found during implementation of `internal/pubsub`: MQTT allows
+exactly one will message per connection, so "an LWT that clears all of a
+daemon's claim topics" is mechanically impossible for any daemon running
+more than one sandbox.** The actual mechanism: each `murod` also maintains a
+single **per-daemon retained presence topic**,
+`muro/<root>/_daemons/<daemon-id>/alive`, published `"online"` on connect
+with its LWT set to publish `"offline"` there on unclean disconnect. A claim
+is treated as stale not by the claim topic clearing itself, but by
+correlating it against its claiming daemon's presence topic: before
+rejecting a launch over a live-looking claim, `murod` also checks whether
+that claim's daemon-id is currently `"online"` — if its presence topic says
+`"offline"` (or has never been seen), the claim is stale and the launch
+proceeds (publishing a fresh claim), rather than being blocked by a claim
+its own daemon can no longer vouch for. This still reuses broker-native
+retained-message + LWT semantics rather than inventing a custom reservation
+protocol, just with one presence topic per daemon instead of one LWT
+attempting to cover every claim topic that daemon owns.
 
 ## 14. Resolved vs. Still-Open (SPEC.md §10 cross-reference)
 
@@ -465,8 +478,10 @@ Resolved by this document (SPEC.md §10 items, in original numbering):
 6. **Packaging/distribution** — three static Go binaries + systemd units +
    install script, same repo/release (§4, §8).
 7. **Cross-daemon name collisions** — reject on broker-visible collision,
-   via a retained claim topic per `namespace/name` plus MQTT Last Will and
-   Testament to clear stale claims from a crashed daemon (§13).
+   via a retained claim topic per `namespace/name` correlated against a
+   single per-daemon presence topic (LWT-backed) to detect staleness from a
+   crashed daemon — corrected from an earlier one-LWT-per-claim design that
+   turned out to be mechanically impossible (§13).
 
 Resolved in this conversation, not part of SPEC.md's original numbered list:
 9. **CLI sandbox addressing** — `<agent-name>` (`namespace/name`, per

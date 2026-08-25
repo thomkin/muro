@@ -40,6 +40,24 @@ type Sandbox struct {
 	RestartCount  int            `json:"restart_count"`
 }
 
+// Clone returns a deep copy of sb — a shallow struct copy would still share
+// the underlying arrays of Mounts/Tools/AllowURLs with the original, so a
+// caller mutating a "copy" could still race with or corrupt the Store's
+// internal state. Store uses Clone on every value crossing its API boundary
+// (in via Put, out via Get/List) so callers never hold a pointer aliased to
+// the Store's own map entries, however they mutate it (internal/sandbox's
+// Manager found this the hard way via go test -race).
+func (sb *Sandbox) Clone() *Sandbox {
+	if sb == nil {
+		return nil
+	}
+	out := *sb
+	out.Mounts = append([]config.Mount(nil), sb.Mounts...)
+	out.Tools = append([]config.Tool(nil), sb.Tools...)
+	out.AllowURLs = append([]string(nil), sb.AllowURLs...)
+	return &out
+}
+
 // NewID generates a unique internal sandbox id, e.g. "sb_8f2a1c9d".
 func NewID() (string, error) {
 	buf := make([]byte, 4)

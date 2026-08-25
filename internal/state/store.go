@@ -115,31 +115,40 @@ func (s *Store) persist() error {
 	return nil
 }
 
-// Put inserts or replaces a sandbox record and persists the registry.
+// Put inserts or replaces a sandbox record and persists the registry. Put
+// stores a Clone of sb, so the caller's own copy can be freely reused or
+// mutated afterward without affecting the Store (or racing with it).
 func (s *Store) Put(sb *Sandbox) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.sandboxes[key(sb.Namespace, sb.Name)] = sb
+	s.sandboxes[key(sb.Namespace, sb.Name)] = sb.Clone()
 	return s.persist()
 }
 
-// Get looks up a sandbox by namespace/name.
+// Get looks up a sandbox by namespace/name. The returned Sandbox is a Clone
+// — safe for the caller to read or mutate freely, since it shares no memory
+// with the Store's internal map entry (mutating it has no effect on the
+// Store; call Put to persist any change back).
 func (s *Store) Get(namespace, name string) (*Sandbox, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	sb, ok := s.sandboxes[key(namespace, name)]
-	return sb, ok
+	if !ok {
+		return nil, false
+	}
+	return sb.Clone(), true
 }
 
 // List returns all sandboxes in namespace, or every sandbox across all
-// namespaces if namespace is "".
+// namespaces if namespace is "". Each returned Sandbox is a Clone, for the
+// same reason as Get.
 func (s *Store) List(namespace string) []*Sandbox {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]*Sandbox, 0, len(s.sandboxes))
 	for _, sb := range s.sandboxes {
 		if namespace == "" || sb.Namespace == namespace {
-			out = append(out, sb)
+			out = append(out, sb.Clone())
 		}
 	}
 	return out

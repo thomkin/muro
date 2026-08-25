@@ -1,0 +1,323 @@
+package proxy
+
+import (
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/thomkin/muro/internal/state"
+)
+
+// hopHeaders are stripped when forwarding a request/response, per RFC 7230
+// §6.1 — they're meaningful only for one hop of the connection, not for the
+// proxied destination.
+var hopHeaders = []string{
+	"Connection", "Proxy-Connection", "Keep-Alive", "Transfer-Encoding",
+	"TE", "Trailer", "Upgrade", "Proxy-Authenticate", "Proxy-Authorization",
+}
+
+// Server is murod's embedded URL-allowlist proxy (DESIGN.md §6.2): plain
+// HTTP is filtered by the full request URL; HTTPS/CONNECT is filtered by
+// destination host+port only (never terminated, never path-inspected) —
+// see handleCONNECT's doc comment for exactly how. Default policy is
+// deny-all: an unidentified sandbox, or one with no registered Allowlist,
+// gets nothing.
+type Server struct {
+	store *state.Store
+
+	mu    sync.RWMutex
+	rules map[string]*Allowlist // keyed by sandbox key ("namespace/name")
+
+	// SandboxKeyFunc resolves which sandbox an incoming connection belongs
+	// to, given its remote address string (net/http's r.RemoteAddr, or a
+	// hijacked net.Conn's RemoteAddr().String()).
+	//
+	// PLACEHOLDER: DESIGN.md §6.2 says real sandboxes get HTTP_PROXY/
+	// HTTPS_PROXY pointing at a loopback address reachable only from inside
+	// that sandbox's own network namespace, and murod resolves the calling
+	// sandbox by which loopback/namespace a connection arrived on. This
+	// package has no real per-sandbox network namespaces to resolve
+	// against in isolation, so the zero-value default here always returns
+	// ("", false) — "no sandbox identified", which the deny-all default
+	// then correctly refuses. cmd/murod replaces this field with real
+	// namespace-based resolution once this package is wired up for real;
+	// tests set it directly to a fixed key. Everything else in this file
+	// (allowlist matching, denial logging, the passthrough relay) is the
+	// actual enforcement logic and is not a placeholder.
+	SandboxKeyFunc func(remoteAddr string) (key string, ok bool)
+
+	logger *slog.Logger
+}
+
+// NewServer creates a Server backed by store for denied-request logging
+// (DESIGN.md §5's denied-URL event log). Register a per-sandbox allowlist
+// with SetAllowlist before traffic for that sandbox is expected to pass.
+func NewServer(store *state.Store) *Server {
+	return &Server{
+		store:          store,
+		rules:          make(map[string]*Allowlist),
+		SandboxKeyFunc: func(string) (string, bool) { return "", false },
+		logger:         slog.Default(),
+	}
+}
+
+// ListenAndServe starts the proxy on addr and blocks. addr is expected to
+// be a loopback address per sandbox network namespace (DESIGN.md §6.2);
+// this package itself is transport-agnostic about that.
+func (s *Server) ListenAndServe(addr string) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("proxy: listen %s: %w", addr, err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(s.handle)}
+	return srv.Serve(ln)
+}
+
+// SetAllowlist hot-swaps the allowlist for sandboxKey (DESIGN.md §6.3/§9 —
+// always live, no restart needed). This is the ProxyUpdater method
+// internal/sandbox.Manager calls by duck typing against its own local
+// ProxyUpdater interface — this package does not import internal/sandbox.
+func (s *Server) SetAllowlist(sandboxKey string, allowURLs []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if a, ok := s.rules[sandboxKey]; ok {
+		a.Swap(allowURLs)
+		return
+	}
+	s.rules[sandboxKey] = NewAllowlist(allowURLs)
+}
+
+func (s *Server) allowlistFor(sandboxKey string) (*Allowlist, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	a, ok := s.rules[sandboxKey]
+	return a, ok
+}
+
+func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodConnect {
+		s.handleCONNECT(w, r)
+		return
+	}
+	s.handleHTTP(w, r)
+}
+
+// handleHTTP proxies a plain-HTTP request, matched against the calling
+// sandbox's allowlist by the full request URL (scheme+host+port+path) —
+// DESIGN.md §6.2: unlike HTTPS, the proxy sees the whole thing in
+// cleartext, so it enforces the whole thing.
+func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
+	key, ok := s.SandboxKeyFunc(r.RemoteAddr)
+
+	fullURL := r.URL.String()
+	if r.URL.Scheme == "" {
+		fullURL = "http://" + r.Host + r.URL.RequestURI()
+	}
+
+	var allowed bool
+	if ok {
+		if a, found := s.allowlistFor(key); found {
+			allowed = a.AllowsHTTP(fullURL)
+		}
+	}
+	if !allowed {
+		s.deny(w, key, r.Host, fullURL, http.StatusForbidden)
+		return
+	}
+
+	s.forwardHTTP(w, r)
+}
+
+func (s *Server) deny(w http.ResponseWriter, sandboxKey, host, url string, status int) {
+	ns, name := splitKey(sandboxKey)
+	if s.store != nil {
+		_ = s.store.RecordDenied(ns, name, host, url)
+	}
+	s.logger.Info("proxy: denied", "sandbox", sandboxKey, "host", host, "url", url)
+	http.Error(w, "muro: destination not in allowlist", status)
+}
+
+// splitKey splits a "namespace/name" sandbox key. An empty or malformed
+// key (SandboxKeyFunc returned ok=false, so key is "") splits to
+// ("", "") — RecordDenied still gets called with empty fields rather than
+// skipped, so an unidentifiable-sandbox denial is still visible in the
+// event log rather than silently dropped.
+func splitKey(key string) (namespace, name string) {
+	i := strings.IndexByte(key, '/')
+	if i < 0 {
+		return "", key
+	}
+	return key[:i], key[i+1:]
+}
+
+// forwardHTTP relays an allowed plain-HTTP request to its real destination
+// and copies the response back, stripping hop-by-hop headers both ways.
+func (s *Server) forwardHTTP(w http.ResponseWriter, r *http.Request) {
+	outReq := r.Clone(r.Context())
+	outReq.RequestURI = "" // required by http.Transport for outbound requests
+	if outReq.URL.Scheme == "" {
+		outReq.URL.Scheme = "http"
+	}
+	if outReq.URL.Host == "" {
+		outReq.URL.Host = r.Host
+	}
+	stripHopHeaders(outReq.Header)
+
+	resp, err := http.DefaultTransport.RoundTrip(outReq)
+	if err != nil {
+		http.Error(w, "muro: upstream request failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	stripHopHeaders(resp.Header)
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+func stripHopHeaders(h http.Header) {
+	for _, hh := range hopHeaders {
+		h.Del(hh)
+	}
+}
+
+// handleCONNECT proxies an HTTPS (or any CONNECT-tunneled) request.
+// DESIGN.md §6.2: TLS is never terminated, so the request path is never
+// seen — enforcement is by destination host+port only. Two checks apply:
+//
+//  1. The CONNECT target itself (e.g. "api.anthropic.com:443" from the
+//     request line, in r.Host) is checked against the allowlist BEFORE
+//     anything is accepted. If it's not allowed, this responds with a
+//     plain HTTP 403 — no hijack, no TLS involved at all. This is both the
+//     common case and the cheap, easily-testable path.
+//  2. If the target is allowed, the connection is hijacked and a
+//     "200 Connection Established" is sent (required before the client
+//     will start its TLS handshake over the tunnel). The proxy then peeks
+//     the first bytes the client sends — the TLS ClientHello — and
+//     cross-checks its SNI hostname against the allowlist too, as a
+//     defense against a client claiming one CONNECT target while actually
+//     presenting a different (disallowed) SNI to the real destination. If
+//     SNI extraction fails or times out (non-TLS traffic, or an unusually
+//     slow/fragmented ClientHello), this degrades gracefully and proceeds
+//     using the already-validated CONNECT target rather than hanging or
+//     dropping legitimate traffic.
+//
+// Once both checks pass, any bytes already peeked are replayed to the real
+// backend first, then the two connections are relayed byte-for-byte in
+// both directions, untouched, until either side closes — DESIGN.md §6.2's
+// "no CA, no decryption, just pass it through."
+func (s *Server) handleCONNECT(w http.ResponseWriter, r *http.Request) {
+	key, ok := s.SandboxKeyFunc(r.RemoteAddr)
+	target := r.Host // CONNECT's request-target, e.g. "api.anthropic.com:443"
+
+	var allowed bool
+	var allowlist *Allowlist
+	if ok {
+		if a, found := s.allowlistFor(key); found {
+			allowlist = a
+			allowed = a.AllowsHost(target)
+		}
+	}
+	if !allowed {
+		s.deny(w, key, target, target, http.StatusForbidden)
+		return
+	}
+
+	hj, hijackable := w.(http.Hijacker)
+	if !hijackable {
+		http.Error(w, "muro: proxy does not support CONNECT on this listener", http.StatusInternalServerError)
+		return
+	}
+	clientConn, _, err := hj.Hijack()
+	if err != nil {
+		return
+	}
+	defer clientConn.Close()
+
+	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		return
+	}
+
+	peeked := s.peekAndCrossCheckSNI(clientConn, allowlist, key, target)
+	if peeked == nil {
+		return // SNI cross-check denied; connection already closed and denial logged
+	}
+
+	backendConn, err := net.DialTimeout("tcp", target, 10*time.Second)
+	if err != nil {
+		return
+	}
+	defer backendConn.Close()
+
+	if len(peeked) > 0 {
+		if _, err := backendConn.Write(peeked); err != nil {
+			return
+		}
+	}
+
+	relay(clientConn, backendConn)
+}
+
+// peekAndCrossCheckSNI reads up to a small deadline/cap worth of bytes from
+// conn looking for a complete TLS ClientHello, and if one is found, checks
+// its SNI hostname (at the CONNECT target's port) against allowlist. It
+// returns the bytes read so far (to be replayed to the real backend) on
+// success or graceful degradation, or nil if the SNI cross-check explicitly
+// denied the connection — in which case the connection has already been
+// closed by the caller and the denial has already been recorded.
+func (s *Server) peekAndCrossCheckSNI(conn net.Conn, allowlist *Allowlist, sandboxKey, target string) []byte {
+	const maxPeek = 16 * 1024
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	defer conn.SetReadDeadline(time.Time{})
+
+	buf := make([]byte, 0, 4096)
+	tmp := make([]byte, 4096)
+	for len(buf) < maxPeek {
+		n, err := conn.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+			if host, perr := ExtractSNI(buf); perr == nil {
+				_, port, splitErr := net.SplitHostPort(target)
+				if splitErr != nil {
+					port = "443"
+				}
+				if !allowlist.AllowsHost(host + ":" + port) {
+					ns, name := splitKey(sandboxKey)
+					if s.store != nil {
+						_ = s.store.RecordDenied(ns, name, host, "https://"+host+"/")
+					}
+					s.logger.Info("proxy: denied (SNI mismatch)", "sandbox", sandboxKey, "connect_target", target, "sni", host)
+					return nil
+				}
+				return buf
+			}
+		}
+		if err != nil {
+			// Timeout, EOF, or bytes that didn't parse as a ClientHello
+			// within the cap — degrade gracefully and proceed using the
+			// already-validated CONNECT target rather than dropping
+			// legitimate non-TLS-over-CONNECT traffic.
+			return buf
+		}
+	}
+	return buf
+}
+
+// relay copies bytes in both directions between a and b until either side
+// closes, untouched — DESIGN.md §6.2's "no CA, no decryption."
+func relay(a, b net.Conn) {
+	done := make(chan struct{}, 2)
+	go func() { _, _ = io.Copy(a, b); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(b, a); done <- struct{}{} }()
+	<-done
+}
