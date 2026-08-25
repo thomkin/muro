@@ -181,6 +181,19 @@ Explicit, since "Linux only" needs a concrete floor, not just a label:
   runtime dependency given the §6.1 decision to wrap the `bwrap` binary
   rather than reimplement namespace management natively. `murod` checks for
   it at startup.
+- **`slirp4netns` must be installed and on `PATH` — added during
+  implementation, not originally listed here.** §6.2's proxy design
+  requires each sandbox to reach `murod`'s allowlist proxy via a loopback
+  address "only reachable from inside that sandbox's network namespace" —
+  but a `bwrap --unshare-net` sandbox's loopback is fully private, with no
+  route back to the host's, so without something bridging the two the
+  proxy is literally unreachable and the entire URL-allowlist feature is
+  inert. `slirp4netns` is the standard unprivileged fix for exactly this
+  problem (the same tool rootless Podman/Docker use to give an unprivileged
+  network namespace a route to a host service, without `CAP_NET_ADMIN` or
+  root) — `murod` runs one `slirp4netns` instance per sandbox network
+  namespace, giving that sandbox a route to `murod`'s proxy listener and
+  nowhere else. `murod` checks for it at startup alongside `bwrap`.
 - systemd assumed for service management (unit files shipped for `murod`
   and `muro-broker`); running either as a plain foreground process is still
   fully supported and documented, but packaging (unit files, `systemctl
