@@ -2,7 +2,125 @@ package config
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 )
+
+// dangerousHostRoots are host paths that must never be exposed read-write
+// to a sandbox, in either direction: mounting one of these exactly, an
+// ancestor of one (e.g. mounting a parent of StateDir contains StateDir),
+// OR a path narrower than one (e.g. mounting muro's own state.json
+// specifically, a file inside StateDir) as "rw" would let a sandboxed
+// process modify system files or muro's own config/state out from under
+// murod itself. Checked both ways —
+// pathCoversOrEquals(hostAbs, dangerous) || pathCoversOrEquals(dangerous,
+// hostAbs) below — since a narrower mount landing INSIDE one of these is
+// just as much a problem as a broader one containing it: confirmed by
+// direct reproduction that a check catching only "hostAbs covers
+// dangerous" let a mount of state.json itself through undetected —
+// exactly the scenario this validation exists to prevent.
+//
+// "/" is deliberately NOT in this list — see dangerousHostRootsExactOnly,
+// below, for why it needs different (one-directional) treatment.
+//
+// Read-only exposure of these is a much smaller concern (test/integration's
+// own shellMounts() legitimately mounts /usr, /bin, /lib, /lib64 read-only
+// to give a sandbox a working shell) and is not restricted here.
+//
+// This guards against accidental/tooling-generated over-broad profiles,
+// not the sandboxed agent itself — mounts are fixed at launch
+// (Isolator.UpdateMounts never allows a live remount), so there is no
+// runtime escalation path this closes for an already-running sandbox.
+func dangerousHostRoots() []string {
+	roots := []string{"/etc", "/usr", "/bin", "/lib", "/proc", "/sys", "/dev"}
+	if cfgDir, err := ConfigDir(); err == nil && cfgDir != "" {
+		roots = append(roots, cfgDir)
+	}
+	if stateDir, err := StateDir(); err == nil && stateDir != "" {
+		roots = append(roots, stateDir)
+	}
+	return roots
+}
+
+// dangerousHostRootsExactOnly are checked one-directionally only
+// (pathCoversOrEquals(hostAbs, root) — "hostAbs is root, or something
+// broader containing it"), never the symmetric "any overlap" test
+// dangerousHostRoots' entries use:
+//   - "/" — the symmetric test is meaningless here and actively wrong:
+//     pathCoversOrEquals("/", anything) is true for literally every
+//     absolute path by definition (root covers everything), so checking
+//     "does '/' cover hostAbs" would reject every single mount, not just
+//     root itself. Confirmed by direct reproduction — this exact bug
+//     briefly broke every legitimate mount in this package's own tests
+//     before being caught. Root only needs its one-directional check
+//     (mounting "/" itself); no other absolute path can be broader than
+//     it, and any dangerous subpath of "/" not separately listed
+//     (/etc, /usr, StateDir, ...) isn't dangerous enough to warrant
+//     blocking arbitrary siblings under it.
+//   - the operator's home directory — a mount NARROWER than home (e.g.
+//     ~/projects/foo, the normal, expected case) is legitimate and must
+//     stay allowed; only the home directory itself, or something broader
+//     containing it, is rejected.
+func dangerousHostRootsExactOnly() []string {
+	roots := []string{"/"}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		roots = append(roots, home)
+	}
+	return roots
+}
+
+// sandboxScaffoldPaths are the fixed paths BwrapIsolator.buildArgs already
+// sets up for every sandbox (--proc /proc --dev /dev --tmpfs /tmp,
+// internal/sandbox/bwrap.go) — a profile mount landing on one of these
+// sandbox-internal paths would override that restricted scaffolding,
+// regardless of the mount's own mode.
+func sandboxScaffoldPaths() []string {
+	return []string{"/proc", "/dev", "/tmp"}
+}
+
+// expandHome resolves a leading "~" the same way a shell would, for
+// comparison purposes only — muro's own mount handling doesn't expand "~"
+// itself (a profile's Mount.Host is passed to bwrap as written), but a
+// profile author writing "~/whatever" clearly means it relative to their
+// home directory, and validation needs to see through that to catch
+// "~" (home root) itself being mounted rw.
+func expandHome(path string) string {
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return path
+	}
+	if path == "~" {
+		return home
+	}
+	return filepath.Join(home, strings.TrimPrefix(path, "~/"))
+}
+
+// pathCoversOrEquals reports whether mounting/using `outer` would expose
+// `inner` — either the same path, or `outer` is an ancestor directory of
+// `inner`. Both are filepath.Clean'd first and compared on path-component
+// boundaries (so "/etc" does not also match "/etcfoo").
+func pathCoversOrEquals(outer, inner string) bool {
+	if !filepath.IsAbs(outer) || !filepath.IsAbs(inner) {
+		// Only absolute (or home-expanded) paths are checked — a relative
+		// host path's actual target depends on murod's CWD at launch time,
+		// which this validation has no way to resolve; existing behavior
+		// for relative paths is unchanged.
+		return false
+	}
+	outer = filepath.Clean(outer)
+	inner = filepath.Clean(inner)
+	if outer == string(filepath.Separator) {
+		return true // root covers everything
+	}
+	if outer == inner {
+		return true
+	}
+	return strings.HasPrefix(inner, outer+string(filepath.Separator))
+}
 
 // toolRoot is the fixed sandbox-internal directory non-wildcard tools are
 // mounted into (DESIGN.md §10): a tool declared `{"as": "git"}` lands at
@@ -14,6 +132,34 @@ var validRestartPolicies = map[string]bool{
 	"never":      true,
 	"on-failure": true,
 	"always":     true,
+}
+
+// ValidSandboxName rejects a sandbox namespace or name value that could be
+// used to construct a path outside its intended directory — most directly
+// internal/config.SandboxLogPath, which builds a filename by concatenating
+// namespace+"__"+name with no sanitization of its own, but this is the
+// single, shared validation point every request accepting a namespace/name
+// pair from a client (CLI or control API) should call, rather than relying
+// on each individual path-consuming function downstream to separately
+// guard against it. Deliberately permissive otherwise: letters, digits,
+// hyphens, underscores, and dots (other than a leading dot, or "..") are
+// all accepted, since real sandbox/namespace names are expected to look
+// like ordinary identifiers, not need much restricting beyond "no path
+// traversal or separators."
+func ValidSandboxName(kind, s string) error {
+	if s == "" {
+		return fmt.Errorf("%s must not be empty", kind)
+	}
+	if strings.ContainsAny(s, "/\\") {
+		return fmt.Errorf("%s %q must not contain a path separator", kind, s)
+	}
+	if strings.Contains(s, "..") {
+		return fmt.Errorf("%s %q must not contain \"..\"", kind, s)
+	}
+	if strings.HasPrefix(s, ".") {
+		return fmt.Errorf("%s %q must not start with \".\"", kind, s)
+	}
+	return nil
 }
 
 // ValidateProfile checks a profile for internal consistency before it's
@@ -59,6 +205,42 @@ func ValidateProfile(p *Profile) error {
 		if t, ok := toolTargets[m.SandboxPath]; ok {
 			return fmt.Errorf("profile %q: mount %q and tool %q (as %q) both target sandbox path %q",
 				p.Name, m.Host, t.Host, t.As, m.SandboxPath)
+		}
+
+		if m.Mode == "rw" {
+			hostAbs := expandHome(m.Host)
+			for _, dangerous := range dangerousHostRoots() {
+				// Symmetric: either direction of overlap is rejected. A
+				// mount narrower than a dangerous root (e.g. StateDir's own
+				// state.json) is just as much a problem as one that
+				// contains the root entirely.
+				if pathCoversOrEquals(hostAbs, dangerous) || pathCoversOrEquals(dangerous, hostAbs) {
+					return fmt.Errorf("profile %q: mount %q -> %q is read-write and overlaps %q — "+
+						"mounting this path read-write would let the sandbox modify it; "+
+						"use mode \"ro\" if read access is all that's needed",
+						p.Name, m.Host, m.SandboxPath, dangerous)
+				}
+			}
+			// "/" and home are checked one-directionally only, not via the
+			// symmetric loop above — see dangerousHostRootsExactOnly's doc
+			// comment for why (a symmetric check against "/" would reject
+			// every mount; a symmetric check against home would reject
+			// legitimate subdirectory mounts like ~/projects/foo).
+			for _, exact := range dangerousHostRootsExactOnly() {
+				if pathCoversOrEquals(hostAbs, exact) {
+					return fmt.Errorf("profile %q: mount %q -> %q is read-write and covers %q — "+
+						"mount a narrower subdirectory instead, or use mode \"ro\" if read access is all that's needed",
+						p.Name, m.Host, m.SandboxPath, exact)
+				}
+			}
+		}
+
+		for _, scaffold := range sandboxScaffoldPaths() {
+			if pathCoversOrEquals(m.SandboxPath, scaffold) {
+				return fmt.Errorf("profile %q: mount %q -> %q would override the sandbox's own %q scaffolding "+
+					"(bwrap sets this up for every sandbox); choose a different sandbox_path",
+					p.Name, m.Host, m.SandboxPath, scaffold)
+			}
 		}
 	}
 

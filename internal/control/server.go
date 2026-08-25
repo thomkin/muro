@@ -245,10 +245,34 @@ func (s *Server) handleStatus(payload json.RawMessage) Response {
 	return okResp(StatusResponse{Sandboxes: views})
 }
 
+// validateNamespaceName rejects a namespace/name pair that could be used
+// to construct a path outside its intended directory (most directly
+// config.SandboxLogPath) — applied uniformly at every request handler that
+// accepts these from a client, not just the one (sandbox.run, via
+// Manager.Run -> the Store -> SandboxLogPath) that actually creates new
+// state; the daemon shouldn't trust the CLI is the only possible client of
+// its control API (DESIGN.md's own framing of this as a general protocol).
+// namespace may be empty (defaultNS's "default" applies later); name is
+// always required.
+func validateNamespaceName(namespace, name string) error {
+	if err := config.ValidSandboxName("name", name); err != nil {
+		return err
+	}
+	if namespace != "" {
+		if err := config.ValidSandboxName("namespace", namespace); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Server) handleSandboxShow(payload json.RawMessage) Response {
 	var req SandboxShowRequest
 	if err := json.Unmarshal(payload, &req); err != nil {
 		return errResp(fmt.Errorf("bad sandbox.show payload: %w", err))
+	}
+	if err := validateNamespaceName(req.Namespace, req.Name); err != nil {
+		return errResp(err)
 	}
 	ns := defaultNS(req.Namespace)
 	sb, ok := s.store.Get(ns, req.Name)
@@ -262,6 +286,10 @@ func (s *Server) handleSandboxRun(payload json.RawMessage) Response {
 	var req SandboxRunRequest
 	if err := json.Unmarshal(payload, &req); err != nil {
 		return errResp(fmt.Errorf("bad sandbox.run payload: %w", err))
+	}
+
+	if err := validateNamespaceName(req.Namespace, req.Name); err != nil {
+		return errResp(err)
 	}
 
 	profile, err := config.LoadProfile(req.Profile)
@@ -283,6 +311,16 @@ func (s *Server) handleSandboxUpdate(payload json.RawMessage) Response {
 	var req SandboxUpdateRequest
 	if err := json.Unmarshal(payload, &req); err != nil {
 		return errResp(fmt.Errorf("bad sandbox.update payload: %w", err))
+	}
+	if req.Selector.Name != "" {
+		if err := config.ValidSandboxName("name", req.Selector.Name); err != nil {
+			return errResp(err)
+		}
+	}
+	if req.Namespace != "" {
+		if err := config.ValidSandboxName("namespace", req.Namespace); err != nil {
+			return errResp(err)
+		}
 	}
 
 	sel := sandbox.Selector{
@@ -317,6 +355,9 @@ func (s *Server) handleSandboxReload(payload json.RawMessage) Response {
 	if err := json.Unmarshal(payload, &req); err != nil {
 		return errResp(fmt.Errorf("bad sandbox.reload payload: %w", err))
 	}
+	if err := validateNamespaceName(req.Namespace, req.Name); err != nil {
+		return errResp(err)
+	}
 	ns := defaultNS(req.Namespace)
 	if err := s.mgr.Reload(ns, req.Name); err != nil {
 		return errResp(err)
@@ -336,6 +377,9 @@ func (s *Server) handleSandboxRestart(payload json.RawMessage) Response {
 	if err := json.Unmarshal(payload, &req); err != nil {
 		return errResp(fmt.Errorf("bad sandbox.restart payload: %w", err))
 	}
+	if err := validateNamespaceName(req.Namespace, req.Name); err != nil {
+		return errResp(err)
+	}
 	if err := s.mgr.Restart(defaultNS(req.Namespace), req.Name); err != nil {
 		return errResp(err)
 	}
@@ -346,6 +390,9 @@ func (s *Server) handleSandboxStop(payload json.RawMessage) Response {
 	var req SandboxStopRequest
 	if err := json.Unmarshal(payload, &req); err != nil {
 		return errResp(fmt.Errorf("bad sandbox.stop payload: %w", err))
+	}
+	if err := validateNamespaceName(req.Namespace, req.Name); err != nil {
+		return errResp(err)
 	}
 	if err := s.mgr.Stop(defaultNS(req.Namespace), req.Name); err != nil {
 		return errResp(err)

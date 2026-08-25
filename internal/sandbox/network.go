@@ -396,6 +396,19 @@ func applyEgressRestriction(innerPID int, proxyAddr string) error {
 		return fmt.Errorf("parse proxy address %q: %w", proxyAddr, err)
 	}
 
+	// Defensive re-check, SECURITY_REVIEW.md finding #4: innerPID was
+	// discovered by the caller some time before this function runs, and a
+	// fast-exiting sandbox's PID can be reaped and reused by an unrelated
+	// process in that window (the same class of race InnerNamespacePID's
+	// own doc comment already describes). Without this, a "successful" nft
+	// run below could silently apply this ruleset to that unrelated
+	// process's namespace instead of erroring — narrows, does not fully
+	// eliminate, the race (a check-then-act gap always remains); that's the
+	// accepted standard elsewhere in this file too, not a regression here.
+	if !isAlivePID(innerPID) {
+		return errSandboxAlreadyExited
+	}
+
 	// Destination is slirpGatewayAddr, not proxyAddr's own host — see its
 	// doc comment. The sandbox's own outbound traffic toward the proxy is
 	// addressed to the gateway from the sandbox's point of view; that's

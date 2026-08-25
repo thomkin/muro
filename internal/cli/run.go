@@ -5,6 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/thomkin/muro/internal/config"
 	"github.com/thomkin/muro/internal/control"
 )
 
@@ -30,6 +31,15 @@ var runCmd = &cobra.Command{
 	Short: "Launch a new sandboxed agent instance from a profile",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := config.ValidSandboxName("--name", runNameFlag); err != nil {
+			return usageErr("%v", err)
+		}
+		if runNamespaceFlag != "" {
+			if err := config.ValidSandboxName("--namespace", runNamespaceFlag); err != nil {
+				return usageErr("%v", err)
+			}
+		}
+
 		c, err := dialControl()
 		if err != nil {
 			return err

@@ -113,6 +113,16 @@ func run() int {
 			ln, err = net.Listen("unix", spec.SocketPath)
 			if err != nil {
 				log.Printf("muro-shim: listen on socket: %v", err)
+			} else if err := os.Chmod(spec.SocketPath, 0o600); err != nil {
+				// SECURITY_REVIEW.md informational finding: the parent
+				// directory's 0700 permission (above) already blocks any
+				// other local user from reaching this socket at all, so
+				// this failing isn't a live exposure — but it's one line to
+				// harden explicitly rather than rely solely on that
+				// incidental protection, matching the same pattern
+				// internal/control/server.go's ListenAndServe already uses
+				// for the control socket.
+				log.Printf("muro-shim: chmod socket: %v", err)
 			}
 		}
 

@@ -27,6 +27,10 @@ func (s *Server) handleAttach(conn net.Conn, r *bufio.Reader, req Request) {
 		_ = writeResponse(conn, errResp(err))
 		return
 	}
+	if err := validateNamespaceName(areq.Namespace, areq.Name); err != nil {
+		_ = writeResponse(conn, errResp(err))
+		return
+	}
 
 	pty, detach, err := s.mgr.Attach(defaultNS(areq.Namespace), areq.Name)
 	if err != nil {
@@ -78,6 +82,10 @@ func (s *Server) handleAttach(conn net.Conn, r *bufio.Reader, req Request) {
 func (s *Server) handleLogs(conn net.Conn, req Request) {
 	var lreq LogsRequest
 	if err := json.Unmarshal(req.Payload, &lreq); err != nil {
+		_ = writeResponse(conn, errResp(err))
+		return
+	}
+	if err := validateNamespaceName(lreq.Namespace, lreq.Name); err != nil {
 		_ = writeResponse(conn, errResp(err))
 		return
 	}

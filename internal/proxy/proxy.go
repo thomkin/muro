@@ -53,6 +53,28 @@ type Server struct {
 	SandboxKeyFunc func(remoteAddr string) (key string, ok bool)
 
 	logger *slog.Logger
+
+	// ReadHeaderTimeout/ReadTimeout/WriteTimeout/IdleTimeout configure the
+	// http.Server ListenAndServe constructs — the slow-loris mitigation
+	// (SECURITY_REVIEW.md finding #3): without them, a sandboxed process
+	// can open many connections and send headers (or a CONNECT line) at a
+	// trickle or never, tying up a goroutine/fd per connection indefinitely
+	// and denying network access to every other sandbox this proxy serves.
+	// Exported as fields (not hardcoded in ListenAndServe) so tests can
+	// shrink them to keep a slow-loris regression test fast; NewServer sets
+	// production-sane defaults. ReadHeaderTimeout is what actually matters
+	// for the pre-hijack slow-loris case; ReadTimeout/WriteTimeout mainly
+	// protect the plain-HTTP (non-CONNECT) path — a hijacked CONNECT tunnel
+	// has any inherited deadline explicitly cleared in handleCONNECT right
+	// after Hijack, specifically so a long-lived legitimate tunnel is never
+	// at risk of being killed by these once relaying is underway (see that
+	// function's comment; net/http's Hijacker docs say a hijacked
+	// connection "may have read or write deadlines already set... it is
+	// the caller's responsibility to set or clear those as needed").
+	ReadHeaderTimeout time.Duration
+	ReadTimeout       time.Duration
+	WriteTimeout      time.Duration
+	IdleTimeout       time.Duration
 }
 
 // NewServer creates a Server backed by store for denied-request logging
@@ -66,6 +88,20 @@ func NewServer(store *state.Store) *Server {
 		rules:     make(map[string]*Allowlist),
 		addrIndex: make(map[string]string),
 		logger:    slog.Default(),
+
+		// Production defaults (SECURITY_REVIEW.md finding #3).
+		// ReadHeaderTimeout: generous for any legitimate client (headers
+		// arrive in one write, essentially instantly) but bounds a
+		// deliberately slow/idle one. ReadTimeout/WriteTimeout: only
+		// meaningfully apply to the plain-HTTP path in practice (see
+		// handleCONNECT's deadline-clearing). IdleTimeout: bounds an idle
+		// keep-alive connection waiting for its next request; does not
+		// apply to an actively-relaying hijacked tunnel, which net/http no
+		// longer tracks as "idle" (or at all) once hijacked.
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       2 * time.Minute,
 	}
 	s.SandboxKeyFunc = s.resolveSandboxKeyByAddr
 	return s
@@ -110,7 +146,13 @@ func (s *Server) ListenAndServe(addr string) error {
 	if err != nil {
 		return fmt.Errorf("proxy: listen %s: %w", addr, err)
 	}
-	srv := &http.Server{Handler: http.HandlerFunc(s.handle)}
+	srv := &http.Server{
+		Handler:           http.HandlerFunc(s.handle),
+		ReadHeaderTimeout: s.ReadHeaderTimeout,
+		ReadTimeout:       s.ReadTimeout,
+		WriteTimeout:      s.WriteTimeout,
+		IdleTimeout:       s.IdleTimeout,
+	}
 	return srv.Serve(ln)
 }
 
@@ -279,6 +321,17 @@ func (s *Server) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer clientConn.Close()
+
+	// A hijacked connection may already have a read/write deadline armed by
+	// the server (ReadTimeout/WriteTimeout, if set) from before Hijack was
+	// called — net/http's Hijacker docs are explicit that clearing it is
+	// the caller's responsibility. Without this, a legitimate long-lived
+	// CONNECT tunnel (a real, ongoing HTTPS session to an allowed
+	// destination) would be silently killed mid-relay once that deadline
+	// elapsed, entirely unrelated to whether the tunnel is still actively
+	// in use.
+	_ = clientConn.SetReadDeadline(time.Time{})
+	_ = clientConn.SetWriteDeadline(time.Time{})
 
 	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 		return

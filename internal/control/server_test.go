@@ -135,6 +135,57 @@ func TestSocketPermissions(t *testing.T) {
 	}
 }
 
+func TestValidateNamespaceName(t *testing.T) {
+	if err := validateNamespaceName("", "agent-1"); err != nil {
+		t.Errorf("empty namespace + valid name should be accepted, got: %v", err)
+	}
+	if err := validateNamespaceName("default", "agent-1"); err != nil {
+		t.Errorf("valid namespace + name should be accepted, got: %v", err)
+	}
+	if err := validateNamespaceName("", ""); err == nil {
+		t.Error("expected an error for an empty name")
+	}
+	if err := validateNamespaceName("", "../../etc/passwd"); err == nil {
+		t.Error("expected an error for a path-traversal name")
+	}
+	if err := validateNamespaceName("../../etc", "agent-1"); err == nil {
+		t.Error("expected an error for a path-traversal namespace")
+	}
+}
+
+// TestSandboxRun_RejectsPathTraversalName confirms the control API itself
+// rejects a malicious name — not just the CLI — since the daemon shouldn't
+// trust the CLI is the only possible client of its control API. Without
+// this, a crafted sandbox.run request could have caused
+// config.SandboxLogPath (via muro-shim's log capture) to write outside
+// its intended logs/sandbox/ directory.
+func TestSandboxRun_RejectsPathTraversalName(t *testing.T) {
+	_, socketPath := newTestServer(t)
+	saveTestProfile(t, "test-profile")
+
+	c, err := Dial(socketPath)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close()
+
+	err = c.Call(TypeSandboxRun, SandboxRunRequest{
+		Profile: "test-profile",
+		Name:    "../../etc/passwd",
+	}, nil)
+	if err == nil {
+		t.Fatal("expected sandbox.run to reject a path-traversal name")
+	}
+
+	var status StatusResponse
+	if err := c.Call(TypeStatus, StatusRequest{}, &status); err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if len(status.Sandboxes) != 0 {
+		t.Errorf("a rejected sandbox.run should not have created any sandbox, got %d", len(status.Sandboxes))
+	}
+}
+
 func TestSandboxShow_NotFound(t *testing.T) {
 	_, socketPath := newTestServer(t)
 	c, err := Dial(socketPath)

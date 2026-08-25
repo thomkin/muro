@@ -36,7 +36,16 @@ type Profile struct {
 	RestartPolicy string            `json:"restart_policy"` // never|on-failure|always
 }
 
+// profilePath rejects a name that could escape ProfilesDir (SECURITY_REVIEW.md
+// finding #2's bug class — flagged during that fix's own review as present
+// here too, under the identical unsanitized-concatenation pattern, but out
+// of that fix's scope since it named SandboxLogPath specifically; closed
+// here using the same ValidSandboxName validator rather than a second,
+// possibly-drifting implementation).
 func profilePath(name string) (string, error) {
+	if err := ValidSandboxName("profile name", name); err != nil {
+		return "", err
+	}
 	dir, err := ProfilesDir()
 	if err != nil {
 		return "", err
@@ -73,6 +82,9 @@ func LoadProfile(name string) (*Profile, error) {
 func SaveProfile(p *Profile) error {
 	if p.Name == "" {
 		return fmt.Errorf("profile has no name")
+	}
+	if err := ValidSandboxName("profile name", p.Name); err != nil {
+		return err
 	}
 
 	dir, err := ProfilesDir()

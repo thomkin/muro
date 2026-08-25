@@ -104,6 +104,34 @@ func TestSaveProfile_RequiresName(t *testing.T) {
 	}
 }
 
+// TestSaveProfile_RejectsPathTraversalName and TestLoadProfile_RejectsPathTraversalName
+// cover the same bug class as SECURITY_REVIEW.md finding #2
+// (SandboxLogPath's unsanitized namespace/name concatenation) found present
+// here too during that fix's review: profilePath built
+// filepath.Join(dir, name+".json") with no validation, so a name containing
+// "../" could escape ProfilesDir entirely.
+func TestSaveProfile_RejectsPathTraversalName(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+
+	err := SaveProfile(&Profile{Name: "../../etc/evil"})
+	if err == nil {
+		t.Fatal("expected an error saving a profile with a path-traversal name")
+	}
+
+	// Confirm nothing was actually written outside dir.
+	if _, statErr := os.Stat(filepath.Join(dir, "..", "..", "etc", "evil.json")); statErr == nil {
+		t.Fatal("SaveProfile wrote a file outside ProfilesDir despite returning an error")
+	}
+}
+
+func TestLoadProfile_RejectsPathTraversalName(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if _, err := LoadProfile("../../etc/passwd"); err == nil {
+		t.Fatal("expected an error loading a profile with a path-traversal name")
+	}
+}
+
 func TestListProfiles(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
