@@ -16,6 +16,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -176,6 +177,52 @@ func TestNetworkIsIsolated(t *testing.T) {
 	})
 	if code == 0 {
 		t.Errorf("expected the sandboxed process to have no network access, but the connection attempt succeeded")
+	}
+}
+
+// pidAlive checks /proc/<pid> directly rather than signaling it, so this
+// works regardless of which namespace the test process itself is in.
+func pidAlive(pid int) bool {
+	_, err := os.Stat(filepath.Join("/proc", strconv.Itoa(pid)))
+	return err == nil
+}
+
+// TestLongRunningSandbox_StaysAliveOnItsOwn is a regression test for a
+// misdiagnosis that happened during real debugging of this codebase: a
+// sandbox launched from a profile with NO mounts at all was seen reaching
+// a "crashed" state within seconds and was initially mistaken for a pty
+// lifecycle bug. The actual cause was much simpler — bwrap builds an
+// empty root filesystem unless something is explicitly bound, so the
+// launched command (e.g. /bin/cat) didn't exist inside the sandbox at
+// all, and bwrap's own execve failure was what exited quickly, nothing to
+// do with PTYs. This test proves a *properly mounted* long-running
+// process is genuinely stable on its own (no daemon, no restart involved
+// at all) for well longer than that original few-second false alarm, so
+// a future change that reintroduces a real "dies on its own" bug gets
+// caught here instead of being hand-waved away as "probably like before".
+func TestLongRunningSandbox_StaysAliveOnItsOwn(t *testing.T) {
+	iso := newIsolator(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	h, err := iso.Launch(ctx, sandbox.LaunchSpec{
+		Mounts: shellMounts(),
+		Cmd:    []string{"/bin/sh", "-c", "sleep 20"},
+	})
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	defer iso.Stop(h)
+
+	pid := h.PID()
+	if pid <= 0 {
+		t.Fatalf("expected a positive PID, got %d", pid)
+	}
+
+	time.Sleep(10 * time.Second)
+	if !pidAlive(pid) {
+		t.Errorf("sandboxed process (pid %d) is no longer alive after 10s on its own — a properly mounted, "+
+			"long-running sandbox should not exit by itself", pid)
 	}
 }
 
