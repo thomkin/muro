@@ -38,6 +38,20 @@ func (s *Server) handleAttach(conn net.Conn, r *bufio.Reader, req Request) {
 		return
 	}
 	defer detach()
+	// pty is a fresh connection to muro-shim's attach socket for THIS
+	// session only (bwrapHandle.Stdio dials a new one every call) — it
+	// must be closed when this session ends, or muro-shim's acceptLoop
+	// (cmd/muro-shim, single connection at a time, no per-connection
+	// goroutine) stays blocked forever inside the now-abandoned
+	// handleAttachConn for this leaked connection, permanently starving
+	// every later attach attempt for this sandbox: their own dial
+	// succeeds immediately (the kernel just queues it in the listen
+	// backlog), the client gets a normal "attached OK" handshake, but
+	// nothing is ever actually read from or written to it, since
+	// acceptLoop never calls Accept() again. Confirmed as a real bug, not
+	// hypothetical, while manually verifying the MQTT agent-to-agent
+	// bridge's Stage 2 injection path.
+	defer pty.Close()
 
 	if err := writeResponse(conn, okResp(SandboxAttachResponse{OK: true})); err != nil {
 		return

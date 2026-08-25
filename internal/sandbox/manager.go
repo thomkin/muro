@@ -58,6 +58,16 @@ func registerHandleNetworkAddr(proxy ProxyUpdater, sandboxID string, h Handle) {
 type shimRuntimeInfo interface {
 	ShimSocket() string
 	SlirpPID() int
+
+	// InjectSocket exposes the pty-injection socket path (shim.go) a
+	// freshly-Launched Handle's shim listens on — see
+	// state.Sandbox.InjectSocket's doc comment for why this is persisted
+	// but, unlike ShimSocket/SlirpPID, deliberately NOT threaded through
+	// Reattacher: a Reattach-reconstructed Handle returns "" here, and
+	// captureHandleInfo is never called on that path, so the value from
+	// the sandbox's original Launch survives untouched across a murod
+	// restart.
+	InjectSocket() string
 }
 
 // captureHandleInfo copies whatever PID.md/networking/shim-runtime info h
@@ -72,6 +82,7 @@ func captureHandleInfo(sb *state.Sandbox, h Handle) {
 	if si, ok := h.(shimRuntimeInfo); ok {
 		sb.ShimSocket = si.ShimSocket()
 		sb.SlirpPID = si.SlirpPID()
+		sb.InjectSocket = si.InjectSocket()
 	}
 }
 
@@ -105,6 +116,10 @@ func (m *Manager) Reattach(sb *state.Sandbox) error {
 	if !ok {
 		return fmt.Errorf("isolator does not support reattaching to an already-running sandbox")
 	}
+	// This process's own agent-socket listener for sb doesn't exist yet —
+	// the previous murod's died along with that process, even though the
+	// sandbox (and its bwrap-side mount at the same host path) survived.
+	m.startAgentBridge(sb)
 	h, err := ra.Reattach(sb.PID, sb.ShimSocket, sb.SlirpPID, sb.NetAddr)
 	if err != nil {
 		return fmt.Errorf("reattach sandbox %s/%s: %w", sb.Namespace, sb.Name, err)
@@ -187,6 +202,19 @@ type Manager struct {
 	publisher EventPublisher
 	attachReg *attachRegistry
 
+	// pubStateDir/pubPublisher/pubSubscriber configure the MQTT
+	// agent-to-agent bridge (DESIGN.md §8) — all zero/nil until
+	// EnablePubsub is called, which most callers (nearly the whole
+	// existing test suite) simply never do, leaving the bridge fully
+	// disabled with no behavior change from before it existed.
+	pubStateDir   string
+	pubPublisher  PubsubPublisher
+	pubSubscriber PubsubSubscriber
+
+	pubMu           sync.Mutex
+	agentSockets    map[string]*agentSocketServer // key: sandboxID (state.Sandbox.ID)
+	inboxSubscribed map[string]bool               // key: mapKey(namespace, name)
+
 	maxRestartAttempts int
 	backoffFunc        func(attempt int) time.Duration
 	sleep              func(time.Duration)
@@ -203,9 +231,97 @@ func NewManager(store *state.Store, iso Isolator, proxy ProxyUpdater, publisher 
 		proxy:              proxy,
 		publisher:          publisher,
 		attachReg:          newAttachRegistry(),
+		agentSockets:       make(map[string]*agentSocketServer),
+		inboxSubscribed:    make(map[string]bool),
 		maxRestartAttempts: DefaultMaxRestartAttempts,
 		backoffFunc:        backoffDelay,
 		sleep:              time.Sleep,
+	}
+}
+
+// EnablePubsub turns on the MQTT agent-to-agent bridge (DESIGN.md §8) for
+// every sandbox this Manager subsequently launches or reattaches — optional
+// because most callers (nearly the entire existing test suite) have no
+// broker to connect to and never call this, leaving the whole bridge inert.
+// pub and sub may independently be nil (e.g. pub/sub configured but the
+// broker is currently unreachable): each sandbox's agent socket still
+// starts and its inbox subscription is still skipped/attempted the same
+// way, just with `muro pubsub publish` getting a clear "broker not
+// connected" response instead of the mount silently not existing. Must be
+// called once, before Run/ReattachAll — stateDir can't sensibly change
+// mid-flight since it's already baked into every currently-running
+// sandbox's already-mounted AgentSocketPath. cmd/murod is the only real
+// caller.
+func (m *Manager) EnablePubsub(stateDir string, pub PubsubPublisher, sub PubsubSubscriber) {
+	m.pubStateDir = stateDir
+	m.pubPublisher = pub
+	m.pubSubscriber = sub
+}
+
+func (m *Manager) pubsubEnabled() bool { return m.pubStateDir != "" }
+
+// startAgentBridge brings up sb's half of the MQTT bridge: its outbound
+// agent-socket listener (idempotent per sb.ID) and, once per namespace/name
+// for this Manager's lifetime, an inbox subscription that injects arriving
+// messages into whatever sandbox is currently live at that address (looked
+// up fresh from the Store at delivery time, not captured here — see
+// state.Sandbox.InjectSocket's doc comment for why that's safe across
+// Restart/a murod restart). A no-op if EnablePubsub was never called.
+// Called from Run (before Launch, so the listener is guaranteed up before
+// the sandboxed process could possibly connect — the exact race
+// AgentSocketPath's doc comment already establishes for buildLaunchSpec)
+// and from Reattach (where the sandbox is already running, but this
+// process's own listener for it does not exist yet — the previous murod's
+// died with that process).
+func (m *Manager) startAgentBridge(sb *state.Sandbox) {
+	if !m.pubsubEnabled() {
+		return
+	}
+	m.pubMu.Lock()
+	defer m.pubMu.Unlock()
+
+	if _, ok := m.agentSockets[sb.ID]; !ok {
+		path := AgentSocketPath(m.pubStateDir, sb.ID)
+		if srv, err := startAgentSocket(path, sb.Namespace, m.pubPublisher); err == nil {
+			m.agentSockets[sb.ID] = srv
+		}
+		// A listen failure here is not escalated to a launch failure —
+		// matches this codebase's established tolerance for a
+		// partially-degraded optional subsystem (nil proxy/publisher
+		// elsewhere): the sandbox still runs, just without a working
+		// outbound bridge.
+	}
+
+	key := mapKey(sb.Namespace, sb.Name)
+	if m.pubSubscriber != nil && !m.inboxSubscribed[key] {
+		namespace, name := sb.Namespace, sb.Name
+		err := m.pubSubscriber.SubscribeInbox(namespace, name, func(message []byte) {
+			if live, ok := m.store.Get(namespace, name); ok {
+				injectMessage(live.InjectSocket, message)
+			}
+		})
+		if err == nil {
+			m.inboxSubscribed[key] = true
+		}
+	}
+}
+
+// stopAgentBridge tears down sandboxID's agent-socket listener (Stop's
+// final-teardown path only — Restart and watchLoop's crash-relaunch reuse
+// the same sandboxID and therefore the same AgentSocketPath, so the
+// existing listener keeps serving the freshly-Launched sandbox's new mount
+// unchanged and must NOT be stopped there). The inbox MQTT subscription is
+// deliberately left in place: it's keyed by namespace/name rather than
+// sandboxID, and a later Run reusing that namespace/name (a fresh sb.ID)
+// still wants messages delivered — startAgentBridge's handler always
+// re-reads InjectSocket from the Store at delivery time, so it naturally
+// picks up whichever sandbox is current.
+func (m *Manager) stopAgentBridge(sandboxID string) {
+	m.pubMu.Lock()
+	defer m.pubMu.Unlock()
+	if srv, ok := m.agentSockets[sandboxID]; ok {
+		srv.stop()
+		delete(m.agentSockets, sandboxID)
 	}
 }
 
@@ -240,7 +356,7 @@ func (m *Manager) buildLaunchSpec(sb *state.Sandbox, env map[string]string) Laun
 	// whole launch over — logs just won't capture anything for this
 	// sandbox, same as if the platform genuinely has no home directory.
 	logPath, _ := config.SandboxLogPath(sb.Namespace, sb.Name)
-	return LaunchSpec{
+	spec := LaunchSpec{
 		SandboxID: sb.ID,
 		Mounts:    sb.Mounts,
 		Tools:     sb.Tools,
@@ -249,6 +365,10 @@ func (m *Manager) buildLaunchSpec(sb *state.Sandbox, env map[string]string) Laun
 		PTY:       true,
 		LogPath:   logPath,
 	}
+	if m.pubsubEnabled() {
+		spec.AgentSocketPath = AgentSocketPath(m.pubStateDir, sb.ID)
+	}
+	return spec
 }
 
 // validateSandboxConfig re-runs config.ValidateProfile's tools:/mounts:
@@ -327,8 +447,15 @@ func (m *Manager) Run(profile *config.Profile, name, namespace string) (*state.S
 		StartedAt:     time.Now(),
 	}
 
+	// Started BEFORE Launch, not after: the listener must already be up
+	// the instant bwrap mounts its host path in, or a fast-starting
+	// sandboxed process could dial before anything is listening — see
+	// startAgentBridge's own doc comment.
+	m.startAgentBridge(sb)
+
 	handle, err := m.isolator.Launch(context.Background(), m.buildLaunchSpec(sb, profile.Env))
 	if err != nil {
+		m.stopAgentBridge(sb.ID)
 		return nil, fmt.Errorf("launch sandbox %s/%s: %w", namespace, name, err)
 	}
 	captureHandleInfo(sb, handle)
@@ -548,6 +675,7 @@ func (m *Manager) Stop(namespace, name string) error {
 
 	key := mapKey(namespace, name)
 	m.attachReg.Detach(key)
+	m.stopAgentBridge(sb.ID)
 
 	sb.State = state.StateStopped
 	if err := m.store.Put(&sb); err != nil {

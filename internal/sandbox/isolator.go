@@ -33,6 +33,16 @@ type LaunchSpec struct {
 	// capture — only used by direct Isolator callers/tests that don't go
 	// through Manager, which always sets it.
 	LogPath string
+
+	// AgentSocketPath, if set, is the host-side Unix socket murod listens
+	// on for this sandbox's outbound MQTT publish requests (the
+	// agent-to-agent bridge, agentsocket.go) — BwrapIsolator mounts it
+	// into the sandbox at a fixed internal path (AgentSocketMountPath,
+	// bwrap.go) so `muro pubsub publish` can reach it. Empty means the
+	// bridge is disabled for this sandbox (Manager.pubStateDir unset —
+	// pub/sub not configured at all), in which case no such mount is
+	// added and the sandbox simply has no agent socket.
+	AgentSocketPath string
 }
 
 // Isolator is the sandboxing backend (DESIGN.md §6.1). v1 wraps the bwrap

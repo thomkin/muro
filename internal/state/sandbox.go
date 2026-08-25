@@ -53,6 +53,16 @@ type Sandbox struct {
 	ShimSocket string `json:"shim_socket,omitempty"`
 	NetAddr    string `json:"net_addr,omitempty"`
 	SlirpPID   int    `json:"slirp_pid,omitempty"`
+
+	// InjectSocket is the Unix socket path muro-shim listens on for pty
+	// input injection (internal/sandbox/inject.go) — the inbound half of
+	// the MQTT agent-to-agent bridge (DESIGN.md §8). Persisted, like
+	// ShimSocket, so the daemon's inbox-message listener can dial it
+	// directly from the Store without needing a live Handle at all — this
+	// is what lets an inbox subscription re-delivering a message after a
+	// murod restart still work even though Reattach (internal/sandbox/
+	// bwrap.go) never repopulates this field on its reconstructed Handle.
+	InjectSocket string `json:"inject_socket,omitempty"`
 }
 
 // Clone returns a deep copy of sb — a shallow struct copy would still share

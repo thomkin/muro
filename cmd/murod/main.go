@@ -65,6 +65,9 @@ func run() int {
 	}
 
 	mgr := sandbox.NewManager(store, isolator, proxySrv, publisher)
+	if pubsubClient != nil {
+		mgr.EnablePubsub(stateDir, &pubsubAdapter{client: pubsubClient, topicRoot: cfg.MQTT.TopicRoot}, &pubsubAdapter{client: pubsubClient, topicRoot: cfg.MQTT.TopicRoot})
+	}
 
 	// Reconnect to whatever survived from a previous murod process — real
 	// only since shim.go/cmd/muro-shim exists: a sandbox's shim (and
@@ -201,4 +204,33 @@ type brokerStatus struct {
 
 func (b *brokerStatus) Status() (connected bool, address string, lastErr error) {
 	return b.connected, b.address, b.lastErr
+}
+
+// pubsubAdapter implements sandbox.PubsubPublisher and
+// sandbox.PubsubSubscriber on top of *pubsub.Client — the concrete piece
+// that builds real topic strings (InboxTopic/BroadcastTopic,
+// internal/pubsub/topics.go), kept out of internal/sandbox entirely so that
+// package stays free of any internal/pubsub dependency (see
+// PubsubPublisher/PubsubSubscriber's own doc comments in
+// internal/sandbox/agentsocket.go and inject.go). cmd/murod is the only
+// place both packages are already imported, so it's the natural home for
+// this glue.
+type pubsubAdapter struct {
+	client    *pubsub.Client
+	topicRoot string
+}
+
+func (a *pubsubAdapter) PublishInbox(namespace, name, message string) error {
+	return a.client.Publish(pubsub.InboxTopic(a.topicRoot, namespace, name), []byte(message))
+}
+
+func (a *pubsubAdapter) PublishBroadcast(namespace, topic, message string) error {
+	return a.client.Publish(pubsub.BroadcastTopic(a.topicRoot, namespace, topic), []byte(message))
+}
+
+func (a *pubsubAdapter) SubscribeInbox(namespace, name string, handler func(message []byte)) error {
+	topic := pubsub.InboxTopic(a.topicRoot, namespace, name)
+	return a.client.Subscribe(topic, func(_ string, payload []byte) {
+		handler(payload)
+	})
 }

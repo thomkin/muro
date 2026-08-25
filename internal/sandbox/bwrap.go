@@ -25,6 +25,27 @@ import (
 
 const bwrapBinary = "bwrap"
 
+// AgentSocketMountPath is the fixed, sandbox-internal path every sandbox
+// with the MQTT agent-to-agent bridge enabled gets its agent socket mounted
+// at — a constant, not something a profile configures, matching the same
+// "fixed, not profile-controlled" convention as bwrap's own /proc, /dev,
+// /tmp scaffolding paths.
+const AgentSocketMountPath = "/run/muro/agent.sock"
+
+// AgentSocketPath returns the host-side path murod listens on for
+// sandboxID's agent socket. A pure function of stateDir+sandboxID so both
+// Manager (which starts the listener BEFORE calling Launch, so it's ready
+// the instant a fast-starting sandboxed process could try to connect) and
+// BwrapIsolator.Launch (which mounts it) independently compute the
+// identical path — the same "both sides derive it, neither persists a
+// value the other must read back" pattern config.SandboxLogPath already
+// establishes for LogPath. Lives in the same runDir as shim.sock/
+// exit_status (Launch, below), just not shim-owned — shim.go's Inject
+// socket is the pty-injection half of the bridge, a separate concept.
+func AgentSocketPath(stateDir, sandboxID string) string {
+	return filepath.Join(stateDir, "sandboxes", sandboxID, "agent.sock")
+}
+
 // BwrapIsolator is the v1 Isolator implementation: it execs the bwrap
 // (bubblewrap) binary rather than driving Linux namespace syscalls
 // directly (DESIGN.md §6.1). Filesystem access is deny-by-default — a
@@ -154,7 +175,28 @@ func (b *BwrapIsolator) buildArgs(spec LaunchSpec) []string {
 		"--tmpfs", "/tmp",
 	}
 
-	for _, m := range spec.Mounts {
+	mounts := spec.Mounts
+	if spec.AgentSocketPath != "" {
+		// The agent-to-agent MQTT bridge's outbound half (agentsocket.go):
+		// murod already listens on spec.AgentSocketPath on the host side
+		// (started by Manager before Launch, so it's ready the instant the
+		// sandboxed process could possibly connect) — this mount is what
+		// makes it reachable from inside the sandbox, at a fixed path every
+		// sandbox gets consistently, not something a profile author writes
+		// themselves. rw: `muro pubsub publish` needs to connect() to it,
+		// which requires write access to the socket special file's
+		// directory entry semantics on Linux (connecting to a Unix socket
+		// bind-mounted read-only still works for connect, but bind-mounting
+		// rw here avoids any surprise — the socket's own connect-permission
+		// is governed by its 0600 file mode, not this mount's ro/rw flag,
+		// so this doesn't weaken anything).
+		mounts = append(append([]config.Mount(nil), mounts...), config.Mount{
+			Host:        spec.AgentSocketPath,
+			SandboxPath: AgentSocketMountPath,
+			Mode:        "rw",
+		})
+	}
+	for _, m := range mounts {
 		if m.Mode == "rw" {
 			args = append(args, "--bind", m.Host, m.SandboxPath)
 		} else {
@@ -237,13 +279,24 @@ func (b *BwrapIsolator) Launch(ctx context.Context, spec LaunchSpec) (Handle, er
 	statusPath := filepath.Join(runDir, "exit_status")
 	os.Remove(socketPath) // stale socket from a previous shim at this same ID, if any
 
+	var injectSocketPath string
+	if spec.PTY {
+		// Injection only makes sense for a pty-backed sandbox (there's
+		// nothing to write keystrokes into otherwise) — matches the
+		// existing SocketPath/attach convention of only listening when
+		// spec.PTY is true (cmd/muro-shim's run()).
+		injectSocketPath = filepath.Join(runDir, "inject.sock")
+		os.Remove(injectSocketPath)
+	}
+
 	shimSpec := ShimSpec{
-		BwrapPath:  b.bwrapPath,
-		Args:       args,
-		PTY:        spec.PTY,
-		SocketPath: socketPath,
-		StatusPath: statusPath,
-		LogPath:    spec.LogPath,
+		BwrapPath:        b.bwrapPath,
+		Args:             args,
+		PTY:              spec.PTY,
+		SocketPath:       socketPath,
+		StatusPath:       statusPath,
+		LogPath:          spec.LogPath,
+		InjectSocketPath: injectSocketPath,
 	}
 	specFile, err := writeShimSpec(runDir, shimSpec)
 	if err != nil {
@@ -280,10 +333,11 @@ func (b *BwrapIsolator) Launch(ctx context.Context, spec LaunchSpec) (Handle, er
 	}
 
 	h := &bwrapHandle{
-		shimCmd:    shimCmd,
-		shimPID:    shimCmd.Process.Pid,
-		socketPath: socketPath,
-		statusPath: statusPath,
+		shimCmd:          shimCmd,
+		shimPID:          shimCmd.Process.Pid,
+		socketPath:       socketPath,
+		statusPath:       statusPath,
+		injectSocketPath: injectSocketPath,
 	}
 
 	// Stage 2/3: bridge this sandbox's otherwise fully-isolated network
@@ -476,6 +530,13 @@ type bwrapHandle struct {
 	shimPID    int       // always set; PID() and signaling use this directly rather than shimCmd.Process, which is nil in the reconstructed case
 	socketPath string
 	statusPath string
+	// injectSocketPath is only set on a freshly-Launched handle, empty on
+	// a Reattach-reconstructed one — nothing downstream needs it post-
+	// restart (Manager's inbox-listener reads state.Sandbox.InjectSocket,
+	// already persisted from the original Launch, directly from the
+	// Store rather than through this interface, so there was no need to
+	// thread it through Reattacher's signature too).
+	injectSocketPath string
 
 	netAddr   string         // this sandbox's assigned outbound loopback address, e.g. "127.0.0.5"
 	netBridge *networkBridge // nil if Launch failed before reaching network setup, OR if reconstructed (see slirpPID)
@@ -495,6 +556,11 @@ func (h *bwrapHandle) NetworkAddr() string { return h.netAddr }
 // persists both into state.Sandbox so a restarted murod's Reattach (above)
 // has what it needs without this process's cooperation.
 func (h *bwrapHandle) ShimSocket() string { return h.socketPath }
+
+// InjectSocket implements shimRuntimeInfo (manager.go) — Manager persists
+// it into state.Sandbox.InjectSocket so the MQTT inbox-listener can dial it
+// directly from the Store, without needing a live Handle at all.
+func (h *bwrapHandle) InjectSocket() string { return h.injectSocketPath }
 func (h *bwrapHandle) SlirpPID() int {
 	if h.netBridge != nil {
 		return h.netBridge.pid()

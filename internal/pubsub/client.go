@@ -126,6 +126,20 @@ func (c *Client) PublishDenied(namespace, name, host string) error {
 	return token.Error()
 }
 
+// Publish publishes payload to topic verbatim. Unlike PublishStatus/
+// PublishDenied (which each own a specific topic shape), this is the
+// generic primitive the agent-to-agent bridge (internal/sandbox's
+// PubsubPublisher, wired in by cmd/murod) uses for inbox/broadcast
+// messages, whose topics it builds itself via InboxTopic/BroadcastTopic
+// before calling this.
+func (c *Client) Publish(topic string, payload []byte) error {
+	token := c.mqttClient.Publish(topic, 1, false, payload)
+	if !token.WaitTimeout(5 * time.Second) {
+		return fmt.Errorf("pubsub: publish to %s timed out", topic)
+	}
+	return token.Error()
+}
+
 // Subscribe registers handler to be called for every message published to
 // topic.
 func (c *Client) Subscribe(topic string, handler func(topic string, payload []byte)) error {

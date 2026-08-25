@@ -82,6 +82,7 @@ func run() int {
 
 	var ptmx *os.File
 	var ln net.Listener
+	var injectLn net.Listener
 	if spec.PTY {
 		m, s, err := sandbox.OpenPTY()
 		if err != nil {
@@ -123,6 +124,30 @@ func run() int {
 				// internal/control/server.go's ListenAndServe already uses
 				// for the control socket.
 				log.Printf("muro-shim: chmod socket: %v", err)
+			}
+		}
+
+		// The injection socket (agent-to-agent MQTT bridge's inbound
+		// half, internal/sandbox/inject.go) — deliberately a SEPARATE
+		// listener from ln/SocketPath above, not a second use of the same
+		// one: see ShimSpec.InjectSocketPath's doc comment for why
+		// sharing the attach path would be broken (a short-lived
+		// injector connection would steal, then wrongly clear,
+		// ptyBroadcaster's exclusive "current" attach slot out from under
+		// a real concurrent human session). Also listened BEFORE Start
+		// for the identical race reason as the attach socket above.
+		if spec.InjectSocketPath != "" {
+			if err := os.MkdirAll(filepath.Dir(spec.InjectSocketPath), 0o700); err != nil {
+				log.Printf("muro-shim: create inject socket dir: %v", err)
+			} else {
+				os.Remove(spec.InjectSocketPath)
+				injectLn, err = net.Listen("unix", spec.InjectSocketPath)
+				if err != nil {
+					log.Printf("muro-shim: listen on inject socket: %v", err)
+					injectLn = nil
+				} else if err := os.Chmod(spec.InjectSocketPath, 0o600); err != nil {
+					log.Printf("muro-shim: chmod inject socket: %v", err)
+				}
 			}
 		}
 
@@ -170,6 +195,12 @@ func run() int {
 		// connected; anything the sandbox wrote while unattended was lost.
 		go drainToLog(ptmx, bcast)
 		go acceptLoop(ln, ptmx, bcast)
+	}
+
+	if injectLn != nil {
+		defer injectLn.Close()
+		defer os.Remove(spec.InjectSocketPath)
+		go acceptInjectLoop(injectLn, ptmx)
 	}
 
 	installSignalForwarding(cmd)
@@ -405,6 +436,57 @@ func handleAttachConn(conn net.Conn, ptmx *os.File, bcast *ptyBroadcaster) {
 			return // client disconnected
 		}
 	}
+}
+
+// maxInjectRequestSize bounds a single injection connection's payload —
+// mirrors internal/sandbox/agentsocket.go's maxAgentRequestSize (an
+// injected message originates from another sandbox's agent-socket publish,
+// which is already capped there; this is a second, independent cap on the
+// shim side so a malformed or hostile write to the inject socket can't grow
+// this process's memory without bound).
+const maxInjectRequestSize = 256 << 10
+
+// acceptInjectLoop serves the injection socket — the MQTT inbox bridge's
+// inbound half (internal/sandbox/inject.go dials in, murod-side). Unlike
+// acceptLoop/handleAttachConn, connections here are short-lived (one
+// message, then the sender closes) so handling them synchronously, one at
+// a time, is fine — an injected message racing a human's own concurrent
+// keystrokes into ptmx is an accepted, unavoidable interleaving (both are
+// just bytes written to the same pty), not something this loop needs to
+// serialize against attach's relay.
+func acceptInjectLoop(ln net.Listener, ptmx *os.File) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return // listener closed (shim shutting down) or a real error either way — stop accepting
+		}
+		if ptmx == nil {
+			conn.Close()
+			continue
+		}
+		handleInjectConn(conn, ptmx)
+	}
+}
+
+// handleInjectConn reads one message from conn and writes it DIRECTLY to
+// ptmx — deliberately never touching bcast/ptyBroadcaster in any way (no
+// setCurrent, no write-through-broadcaster, nothing): that's the whole
+// point of this being a separate socket from attach in the first place
+// (see ShimSpec.InjectSocketPath's doc comment). drainToLog's own
+// continuous ptmx.Read is what picks these bytes back up and fans them out
+// to a live attacher/log file, exactly as if the sandboxed program had
+// echoed them itself — this function has no need to duplicate that.
+func handleInjectConn(conn net.Conn, ptmx *os.File) {
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	data, err := io.ReadAll(io.LimitReader(conn, maxInjectRequestSize+1))
+	if err != nil || len(data) == 0 {
+		return
+	}
+	if len(data) > maxInjectRequestSize {
+		data = data[:maxInjectRequestSize]
+	}
+	_, _ = ptmx.Write(data)
 }
 
 // writeFinalStatus records bwrap's real exit outcome to statusPath

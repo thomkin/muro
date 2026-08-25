@@ -13,6 +13,18 @@ type ShimSpec struct {
 	SocketPath string   `json:"socket_path"`        // Unix socket the shim listens on for attach connections
 	StatusPath string   `json:"status_path"`        // where the shim records bwrap's exit status once it's known
 	LogPath    string   `json:"log_path,omitempty"` // where the shim continuously appends pty output; empty disables log capture
+
+	// InjectSocketPath, if set (only when PTY is true), is a SECOND Unix
+	// socket the shim listens on for automated pty input injection — the
+	// MQTT inbox bridge (internal/sandbox's inbox-listener) dials this to
+	// deliver an arriving message as if a human had typed it. Deliberately
+	// a separate socket from SocketPath/attach, not a shared path: attach's
+	// handleAttachConn claims ptyBroadcaster's exclusive "current" slot and
+	// clears it on disconnect, which a short-lived injector connection
+	// would wrongly steal from (and then wrongly clear) a real, concurrent
+	// human attach session. The injection handler never touches
+	// ptyBroadcaster at all — it only ever writes to ptmx directly.
+	InjectSocketPath string `json:"inject_socket_path,omitempty"`
 }
 
 // ShimStatus is written atomically (temp file + rename, same pattern
