@@ -90,13 +90,29 @@ func (f *fakeMQTTClient) publishCount() int {
 }
 
 // fakeClaimLookup implements claimLookup for testing ClaimSandbox's
-// decision logic without a real broker round-trip.
+// decision logic without a real broker round-trip. Topic-aware via
+// byTopic, so a test can give different answers for a claim topic vs. a
+// presence topic (ClaimSandbox now queries both — see daemonIsOnline,
+// claims.go) in the same call; payload/exists/err are the fallback for any
+// topic not present in byTopic, kept for tests that only care about one
+// topic and predate byTopic's addition.
 type fakeClaimLookup struct {
+	payload []byte
+	exists  bool
+	err     error
+
+	byTopic map[string]fakeLookupResult
+}
+
+type fakeLookupResult struct {
 	payload []byte
 	exists  bool
 	err     error
 }
 
 func (f *fakeClaimLookup) currentRetained(topic string) ([]byte, bool, error) {
+	if r, ok := f.byTopic[topic]; ok {
+		return r.payload, r.exists, r.err
+	}
 	return f.payload, f.exists, f.err
 }

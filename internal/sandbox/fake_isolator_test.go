@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"sync"
 
@@ -69,6 +70,24 @@ func (f *fakeIsolator) Stop(h Handle) error {
 	fh := h.(*fakeHandle)
 	fh.finish(0, nil)
 	return nil
+}
+
+// Reattach implements the Reattacher optional interface (manager.go),
+// letting tests exercise Manager.Reattach/ReattachAll without a real
+// bwrap/shim. It looks up the already-launched fakeHandle by pid rather
+// than constructing a new one — a real Reattach reconnects to the SAME
+// still-running process, it doesn't start a new one, and tests rely on
+// this to observe the same underlying `done` channel a later finish()/
+// crash() call affects.
+func (f *fakeIsolator) Reattach(pid int, _ string, _ int, _ string) (Handle, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, h := range f.handles {
+		if h.pid == pid {
+			return h, nil
+		}
+	}
+	return nil, fmt.Errorf("fakeIsolator: no handle with pid %d", pid)
 }
 
 // fakeHandle is a Handle whose exit is entirely test-controlled via

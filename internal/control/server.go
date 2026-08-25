@@ -40,11 +40,24 @@ type Server struct {
 	// go test -race between net.Listen's write and Close's read.
 	listenerMu sync.Mutex
 	listener   net.Listener
+
+	// requestIdleTimeout overrides the default requestIdleTimeout constant
+	// (below) when non-zero — exists so a test can exercise real timeout
+	// behavior (a connection that sends nothing gets disconnected) without
+	// the test suite actually waiting out the production 30s value.
+	requestIdleTimeout time.Duration
 }
 
 // NewServer constructs a Server. broker may be nil.
 func NewServer(mgr *sandbox.Manager, store *state.Store, broker BrokerStatusChecker) *Server {
 	return &Server{mgr: mgr, store: store, broker: broker}
+}
+
+func (s *Server) idleTimeout() time.Duration {
+	if s.requestIdleTimeout > 0 {
+		return s.requestIdleTimeout
+	}
+	return requestIdleTimeout
 }
 
 // ListenAndServe removes any stale socket file at socketPath, listens
@@ -112,6 +125,56 @@ func containsSuffix(s, suffix string) bool {
 	return len(s) >= len(suffix) && s[len(s)-len(suffix):] == suffix
 }
 
+// maxRequestLineSize bounds a single request line before it's ever handed
+// to json.Unmarshal — every real control API payload (profile paths, mount
+// lists, a handful of strings) is at most a few KB; 4MiB is generous
+// headroom for that while still bounding worst-case memory growth from a
+// malformed or hostile line that never terminates in '\n'. bufio.Reader's
+// own ReadBytes has no such limit — it grows its internal buffer without
+// bound chasing the delimiter, which readLineLimited (below) exists to cap.
+const maxRequestLineSize = 4 << 20
+
+// requestIdleTimeout bounds how long handleConn's request loop will block
+// waiting for a client to send its next request line. In this protocol's
+// actual usage every real client (cmd/muro's Client.Call) sends exactly one
+// request within milliseconds of connecting and then either reads its
+// response or upgrades to a stream (attach/logs, which have their own,
+// separately-reasoned-about blocking reads once the request line itself has
+// been read — this deadline only ever governs waiting for THAT first line).
+// Without this, a connection that's accepted but never sends anything (a
+// stray/confused process, or a deliberately silent one) pins a goroutine and
+// its underlying fd on this daemon indefinitely; 30s is far more than any
+// legitimate client ever needs and still short enough that this can't
+// meaningfully accumulate.
+const requestIdleTimeout = 30 * time.Second
+
+// readLineLimited reads one '\n'-terminated line from r, the same contract
+// as bufio.Reader.ReadBytes('\n'), except it errors out once more than
+// maxSize bytes have been read without finding the delimiter, rather than
+// growing without bound. Uses r.ReadByte() in a loop (not ReadSlice/
+// ReadBytes) specifically so this stays on the SAME *bufio.Reader instance
+// handleAttach/handleLogs need to keep reading from afterward (any bytes
+// buffered ahead of the delimiter must not be lost) — switching to
+// bufio.Scanner for its built-in Buffer() size cap would have meant a
+// second, disconnected buffer with no clean way to hand back what it read
+// ahead.
+func readLineLimited(r *bufio.Reader, maxSize int) ([]byte, error) {
+	var line []byte
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			return line, err
+		}
+		line = append(line, b)
+		if b == '\n' {
+			return line, nil
+		}
+		if len(line) > maxSize {
+			return nil, fmt.Errorf("request line exceeds maximum size of %d bytes", maxSize)
+		}
+	}
+}
+
 // handleConn owns one client connection for its whole lifetime: it reads
 // newline-delimited Requests and writes newline-delimited Responses via a
 // single bufio.Reader/net.Conn pair for as long as the connection is a
@@ -124,10 +187,17 @@ func (s *Server) handleConn(conn net.Conn) {
 	r := bufio.NewReader(conn)
 
 	for {
-		line, err := r.ReadBytes('\n')
+		_ = conn.SetReadDeadline(time.Now().Add(s.idleTimeout()))
+		line, err := readLineLimited(r, maxRequestLineSize)
 		if err != nil {
-			return // client disconnected (EOF) or a read error — either way, done
+			return // client disconnected (EOF), idle timeout, oversized line, or a read error — either way, done
 		}
+		// Reads inside handleAttach/handleLogs govern their own blocking
+		// behavior once a stream upgrade begins (an attach session
+		// legitimately waits indefinitely for the next keystroke) — clear
+		// the deadline before handing off so this timeout can't fire mid
+		// session.
+		_ = conn.SetReadDeadline(time.Time{})
 
 		var req Request
 		if err := json.Unmarshal(line, &req); err != nil {

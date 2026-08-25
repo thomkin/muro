@@ -1,8 +1,11 @@
 package control
 
 import (
+	"bufio"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -245,6 +248,100 @@ func TestDaemonShutdown_StopsServer(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("server still accepting connections after daemon.shutdown")
+}
+
+func TestReadLineLimited_NormalLine(t *testing.T) {
+	r := bufio.NewReader(strings.NewReader("hello world\nrest"))
+	line, err := readLineLimited(r, 1024)
+	if err != nil {
+		t.Fatalf("readLineLimited: %v", err)
+	}
+	if string(line) != "hello world\n" {
+		t.Errorf("line = %q, want %q", line, "hello world\n")
+	}
+	// Confirm bytes after the delimiter are still there for a subsequent
+	// read on the same reader (the shared-reader contract handleAttach/
+	// handleLogs depend on).
+	rest, _ := r.ReadString(0)
+	if rest != "rest" {
+		t.Errorf("remaining reader content = %q, want %q", rest, "rest")
+	}
+}
+
+func TestReadLineLimited_OversizedLineRejected(t *testing.T) {
+	huge := strings.Repeat("a", 100) // no trailing '\n' at all
+	r := bufio.NewReader(strings.NewReader(huge))
+	_, err := readLineLimited(r, 50)
+	if err == nil {
+		t.Fatal("expected an error for a line exceeding the size limit")
+	}
+}
+
+// TestHandleConn_OversizedLineDisconnects confirms the fix end to end: a
+// client sending a huge line with no newline gets disconnected quickly
+// rather than the server growing an unbounded buffer waiting for a
+// delimiter that never arrives (SECURITY_REVIEW.md follow-up — control
+// plane/CLI pass).
+func TestHandleConn_OversizedLineDisconnects(t *testing.T) {
+	_, socketPath := newTestServer(t)
+
+	conn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Comfortably over maxRequestLineSize, sent with no trailing newline.
+	oversized := make([]byte, maxRequestLineSize+1024)
+	for i := range oversized {
+		oversized[i] = 'a'
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_, _ = conn.Write(oversized) // the server may close before this fully lands; that's fine, ignore the error
+
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 1)
+	_, err = conn.Read(buf)
+	if err == nil {
+		t.Fatal("expected the connection to be closed by the server after an oversized line, got a successful read")
+	}
+}
+
+// TestHandleConn_IdleClientDisconnected confirms a connection that sends
+// nothing at all is disconnected once requestIdleTimeout elapses, rather
+// than pinning a goroutine/fd on the daemon indefinitely. Uses a short
+// override so this test doesn't wait out the real 30s production value.
+func TestHandleConn_IdleClientDisconnected(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+
+	store := state.NewStore(filepath.Join(dir, "state.json"))
+	if err := store.Load(); err != nil {
+		t.Fatalf("store.Load: %v", err)
+	}
+	mgr := sandbox.NewManager(store, &fakeIsolator{}, nil, nil)
+	srv := NewServer(mgr, store, nil)
+	srv.requestIdleTimeout = 200 * time.Millisecond
+
+	socketPath := filepath.Join(dir, "control.sock")
+	go func() { _ = srv.ListenAndServe(socketPath) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	waitForSocket(t, socketPath)
+
+	conn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Send nothing at all. The server should close its side within
+	// roughly srv.requestIdleTimeout.
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1)
+	_, err = conn.Read(buf)
+	if err == nil {
+		t.Fatal("expected the idle connection to be closed by the server, got a successful read")
+	}
 }
 
 func TestAttach_RawPassthroughAndDetach(t *testing.T) {

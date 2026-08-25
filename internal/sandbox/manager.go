@@ -88,12 +88,18 @@ type Reattacher interface {
 
 // Reattach reconstructs a live Handle for sb, whose process
 // state.Reconcile has already confirmed survived from a previous murod
-// process, and registers it exactly as Run would (proxy allowlist +
-// network address). It deliberately does NOT start a watchLoop —
-// resuming restart_policy tracking across a daemon restart is a separate,
-// explicitly out-of-scope piece (shim.go's design note); this exists
-// solely so `muro sandbox attach`/`stop` keep working against a sandbox
-// that outlived the murod process that originally launched it.
+// process, and registers it exactly as Run would (proxy allowlist,
+// network address, and — since a previously out-of-scope gap was closed
+// here — a watchLoop resuming restart_policy tracking from sb's current,
+// already-persisted RestartCount). This is what lets `muro sandbox
+// attach`/`stop` keep working against a sandbox that outlived the murod
+// process that originally launched it, AND what makes a crash after the
+// restart still get restart_policy applied instead of silently going
+// unwatched. watchLoop reads RestartCount fresh from the Store at the
+// moment the process actually exits (not from sb here), so it's already
+// continuous across a restart with no extra propagation needed — sb's
+// RestartCount was itself loaded from state.json at startup, which
+// watchLoop's own Store.Put calls kept correctly persisted all along.
 func (m *Manager) Reattach(sb *state.Sandbox) error {
 	ra, ok := m.isolator.(Reattacher)
 	if !ok {
@@ -103,13 +109,14 @@ func (m *Manager) Reattach(sb *state.Sandbox) error {
 	if err != nil {
 		return fmt.Errorf("reattach sandbox %s/%s: %w", sb.Namespace, sb.Name, err)
 	}
-	m.setHandle(mapKey(sb.Namespace, sb.Name), h)
+	epoch := m.setHandle(mapKey(sb.Namespace, sb.Name), h)
 	if m.proxy != nil {
 		m.proxy.SetAllowlist(sb.ID, sb.AllowURLs)
 		if sb.NetAddr != "" {
 			m.proxy.RegisterSandboxAddr(sb.ID, sb.NetAddr)
 		}
 	}
+	go m.watchLoop(sb.Namespace, sb.Name, h, epoch)
 	return nil
 }
 

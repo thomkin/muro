@@ -308,6 +308,112 @@ func TestRestartPolicy_AlwaysRetriesAfterCleanExit(t *testing.T) {
 	}
 }
 
+// TestReattach_ResumesRestartPolicyWithContinuousCount closes a real gap:
+// a sandbox that survives a murod restart (via muro-shim + Reattach) used
+// to NOT get its restart_policy re-applied if it crashed again afterward,
+// since Reattach never started a watchLoop. Worse than just "stops
+// watching" would be silently resetting RestartCount to 0 on top of that —
+// this test's real point is proving BOTH that watching resumes AND that
+// it resumes counting from where it left off, not from scratch, so a
+// sandbox can't get more total restart attempts than its policy allows
+// just because murod happened to restart in the middle of its life.
+func TestReattach_ResumesRestartPolicyWithContinuousCount(t *testing.T) {
+	mgr, iso, pub := newTestManager(t)
+	mgr.maxRestartAttempts = 4
+
+	p := testProfile("p1")
+	p.RestartPolicy = "on-failure"
+	if _, err := mgr.Run(p, "agent-1", "default"); err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	// Consume 2 of 4 allowed attempts before the "restart".
+	iso.lastHandle().finish(1, nil) // crash #1 -> relaunch (attempt 1 <= 4)
+	waitForHandleCount(t, iso, 2)
+	iso.lastHandle().finish(1, nil) // crash #2 -> relaunch (attempt 2 <= 4)
+	waitForHandleCount(t, iso, 3)
+	waitForState(t, mgr, "default", "agent-1", state.StateRunning)
+
+	sb, ok := mgr.store.Get("default", "agent-1")
+	if !ok {
+		t.Fatal("sandbox not found in store before simulated restart")
+	}
+	if sb.RestartCount != 2 {
+		t.Fatalf("RestartCount before simulated murod restart = %d, want 2", sb.RestartCount)
+	}
+
+	// mgr's own watchLoop is still genuinely in-flight here, blocked in
+	// Wait() on the current handle — a real murod restart doesn't leave
+	// any equivalent goroutine behind at all (the whole process, and every
+	// goroutine in it, is gone). clearHandle bumps mgr's epoch for this
+	// key, so when that in-flight watchLoop eventually wakes it sees
+	// itself superseded and returns without acting — the same mechanism
+	// Restart/Stop already rely on to invalidate a stale watcher, reused
+	// here to correctly simulate "the old Manager's era is over" instead
+	// of leaving two watchers racing over the same handle (confirmed as a
+	// real test-construction bug, not a production one: production never
+	// has two Managers sharing one handle at the same time).
+	mgr.clearHandle(mapKey("default", "agent-1"))
+
+	// Simulate a murod restart: a FRESH Manager over the SAME store and
+	// isolator (the underlying fakeHandle — standing in for a real
+	// still-running shim process — persists across this, exactly like a
+	// real sandbox surviving because muro-shim isn't murod's child).
+	freshMgr := NewManager(mgr.store, iso, &fakeProxy{}, pub)
+	freshMgr.maxRestartAttempts = 4
+	freshMgr.sleep = func(time.Duration) {}
+
+	if errs := freshMgr.ReattachAll(); len(errs) != 0 {
+		t.Fatalf("ReattachAll errors: %v", errs)
+	}
+
+	// Consume the remaining 2 of 4 attempts through the NEW Manager,
+	// against the SAME underlying handle.
+	iso.lastHandle().finish(1, nil) // crash #3 -> relaunch (attempt 3 <= 4)
+	waitForHandleCount(t, iso, 4)
+	iso.lastHandle().finish(1, nil) // crash #4 -> relaunch (attempt 4 <= 4)
+	waitForHandleCount(t, iso, 5)
+	iso.lastHandle().finish(1, nil) // crash #5 -> exhausted (attempt 5 > 4)
+
+	waitForState(t, freshMgr, "default", "agent-1", state.StateRestartExhausted)
+	if iso.handleCount() != 5 {
+		t.Errorf("handleCount = %d, want 5 (1 original launch + 4 restarts total, not more just because of the restart in between)", iso.handleCount())
+	}
+	assertHasEvent(t, pub, "default/agent-1:restart-exhausted")
+}
+
+// TestReattach_SkipsSandboxesReconcileAlreadyMarkedDead confirms
+// ReattachAll only starts a watchLoop for sandboxes state.Reconcile still
+// considers genuinely live (StateRunning) — a sandbox Reconcile already
+// downgraded to StateStopped (dead PID) has no live process left to Wait()
+// on, and must not be handed to Reattach at all.
+func TestReattach_SkipsSandboxesReconcileAlreadyMarkedDead(t *testing.T) {
+	mgr, iso, pub := newTestManager(t)
+
+	p := testProfile("p1")
+	p.RestartPolicy = "on-failure"
+	if _, err := mgr.Run(p, "agent-1", "default"); err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	// Simulate Reconcile already having found this sandbox's PID dead at
+	// startup and downgraded it, before ReattachAll ever runs.
+	sb, _ := mgr.store.Get("default", "agent-1")
+	sb.State = state.StateStopped
+	if err := mgr.store.Put(sb); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	freshMgr := NewManager(mgr.store, iso, &fakeProxy{}, pub)
+	if errs := freshMgr.ReattachAll(); len(errs) != 0 {
+		t.Fatalf("ReattachAll errors: %v", errs)
+	}
+
+	if _, ok := freshMgr.getHandle(mapKey("default", "agent-1")); ok {
+		t.Error("ReattachAll registered a live handle for a sandbox Reconcile already marked stopped")
+	}
+}
+
 func TestAttach_ExclusiveThenReleasedByDetach(t *testing.T) {
 	mgr, _, _ := newTestManager(t)
 

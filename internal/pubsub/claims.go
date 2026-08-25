@@ -66,23 +66,20 @@ func (m *mqttClaimLookup) currentRetained(topic string) ([]byte, bool, error) {
 
 // ClaimSandbox registers this daemon as the owner of namespace/name via a
 // retained MQTT message at ClaimTopic(root, namespace, name)
-// (DESIGN.md §13). If a live claim from a *different* daemon already
+// (DESIGN.md §13). If a *live* claim from a different daemon already
 // exists there, the claim is rejected and nothing is published — callers
 // must not launch the sandbox in that case. Re-claiming a name this same
 // daemon already holds (e.g. across a reload/restart) succeeds and
 // refreshes the timestamp.
 //
-// Automatically detecting that a *different* daemon's claim is stale
-// because that daemon crashed (rather than genuinely still owning the
-// name) requires correlating the claim against that daemon's presence
-// topic (see client.go's presenceTopic doc comment for why a single
-// per-claim LWT isn't mechanically possible) — that correlation is not
-// implemented here.
-// TODO(integration): exercise real stale-claim correlation against a
-// live muro-broker once one exists (IMPLEMENTATION.md Phase 11); for now
-// a stale claim from a crashed daemon must be cleared via ReleaseClaim by
-// an operator, or will simply expire once that daemon's own process
-// eventually calls ReleaseClaim/ClaimSandbox again.
+// A different daemon's claim is treated as stale — and this claim allowed
+// to proceed instead of being rejected — when that daemon's presence
+// topic (client.go's presenceTopic) is not currently "online": either it
+// was never seen, or its LWT already fired an "offline" there (an unclean
+// disconnect, i.e. a crash). This is the DESIGN.md §13 correlation a
+// single per-claim LWT can't provide on its own (see presenceTopic's doc
+// comment) — reuses the same claimLookup a plain claim check already
+// needs, since a presence topic is just another retained-message topic.
 func (c *Client) ClaimSandbox(namespace, name string) error {
 	topic := ClaimTopic(c.topicRoot, namespace, name)
 
@@ -96,8 +93,18 @@ func (c *Client) ClaimSandbox(namespace, name string) error {
 			return fmt.Errorf("pubsub: parsing existing claim for %s/%s: %w", namespace, name, err)
 		}
 		if existing.DaemonID != c.daemonID {
-			return fmt.Errorf("namespace/name already claimed by daemon %s since %s",
-				existing.DaemonID, existing.ClaimedAt.Format(time.RFC3339))
+			online, err := c.daemonIsOnline(existing.DaemonID)
+			if err != nil {
+				return fmt.Errorf("pubsub: checking presence of daemon %s for %s/%s: %w",
+					existing.DaemonID, namespace, name, err)
+			}
+			if online {
+				return fmt.Errorf("namespace/name already claimed by daemon %s since %s",
+					existing.DaemonID, existing.ClaimedAt.Format(time.RFC3339))
+			}
+			// existing.DaemonID is not online — its claim is stale (that
+			// daemon crashed or was never cleanly stopped). Fall through
+			// and publish this daemon's own claim, overwriting it.
 		}
 		// Same daemon re-claiming its own name — allowed, refresh below.
 	}
@@ -112,6 +119,21 @@ func (c *Client) ClaimSandbox(namespace, name string) error {
 		return fmt.Errorf("pubsub: publish claim for %s/%s timed out", namespace, name)
 	}
 	return token.Error()
+}
+
+// daemonIsOnline reports whether daemonID's presence topic currently reads
+// "online" — false for both "no retained message" (never seen, or a clean
+// disconnect that never republished offline) and "offline" (LWT fired).
+// Either case means that daemon cannot currently vouch for its claim.
+func (c *Client) daemonIsOnline(daemonID string) (bool, error) {
+	payload, exists, err := c.lookup.currentRetained(presenceTopic(c.topicRoot, daemonID))
+	if err != nil {
+		return false, err
+	}
+	if !exists {
+		return false, nil
+	}
+	return string(payload) == "online", nil
 }
 
 // ReleaseClaim clears this daemon's claim on namespace/name by publishing

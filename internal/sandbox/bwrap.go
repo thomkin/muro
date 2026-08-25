@@ -540,10 +540,24 @@ func (h *bwrapHandle) waitLive() {
 // shim's parent, so there is no wait4(2) call available — poll PID
 // liveness instead, then recover the real exit code the shim recorded
 // (ShimStatus, shim.go) just before it exited.
+//
+// Also tears down the network bridge via stopSlirpByPID(h.slirpPID) once
+// the shim is confirmed gone — the same reasoning waitLive's h.netBridge.
+// stop() call already documents (a sandbox that exits on its own, not via
+// an explicit Stop(), still needs its slirp4netns process cleaned up or it
+// leaks forever), but netBridge is always nil for a reconstructed handle
+// (this process was never that bridge's parent — see bwrapHandle's own
+// field doc comment), so the PID-based fallback is what's needed here.
+// This path was unreachable until Manager.Reattach started spawning a
+// watchLoop (which is what actually calls Wait on a reconstructed handle)
+// — confirmed as a real, previously-latent gap by direct reproduction: a
+// sandbox reattached after a murod restart, then crashing on its own,
+// left its original slirp4netns process running indefinitely without it.
 func (h *bwrapHandle) waitReconstructed() {
 	for isAlivePID(h.shimPID) {
 		time.Sleep(100 * time.Millisecond)
 	}
+	stopSlirpByPID(h.slirpPID)
 	data, err := os.ReadFile(h.statusPath)
 	if err != nil {
 		h.exitCode, h.waitErr = -1, fmt.Errorf("shim exited, exit status unavailable: %w", err)
