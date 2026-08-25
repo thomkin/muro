@@ -243,6 +243,7 @@ func (b *BwrapIsolator) Launch(ctx context.Context, spec LaunchSpec) (Handle, er
 		PTY:        spec.PTY,
 		SocketPath: socketPath,
 		StatusPath: statusPath,
+		LogPath:    spec.LogPath,
 	}
 	specFile, err := writeShimSpec(runDir, shimSpec)
 	if err != nil {

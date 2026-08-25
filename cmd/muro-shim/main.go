@@ -31,6 +31,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -140,7 +141,25 @@ func run() int {
 	if ln != nil {
 		defer ln.Close()
 		defer os.Remove(spec.SocketPath)
-		go acceptLoop(ln, ptmx)
+
+		bcast := &ptyBroadcaster{}
+		if spec.LogPath != "" {
+			if lf, err := openLogFile(spec.LogPath); err != nil {
+				log.Printf("muro-shim: open log file %s: %v (continuing without log capture)", spec.LogPath, err)
+			} else {
+				defer lf.Close()
+				bcast.logFile = lf
+			}
+		}
+		// One continuous reader for ptmx's whole life, independent of
+		// whether anything is attached — this is what makes `muro logs`
+		// see output produced while nobody was attached, and (since this
+		// process itself survives a murod restart) output produced while
+		// murod was down too. Previously ptmx was only ever read from
+		// inside relay(), i.e. only while a client happened to be
+		// connected; anything the sandbox wrote while unattended was lost.
+		go drainToLog(ptmx, bcast)
+		go acceptLoop(ln, ptmx, bcast)
 	}
 
 	installSignalForwarding(cmd)
@@ -230,12 +249,97 @@ func isAlive(pid int) bool {
 	return err == nil || (!errors.Is(err, os.ErrProcessDone) && !errors.Is(err, syscall.ESRCH))
 }
 
+// ptyBroadcaster is the single point every byte ptmx ever produces passes
+// through: always to logFile (if set), and to whichever client connection
+// is currently attached (if any) — see drainToLog. Kept separate from any
+// one connection's lifetime so log capture works whether or not anyone is
+// attached.
+type ptyBroadcaster struct {
+	mu      sync.Mutex
+	current net.Conn // the one currently-attached connection, or nil
+	logFile *os.File // write handle (append mode); nil if file-based log capture disabled
+	replay  []byte   // bounded recent-output buffer, ALWAYS maintained regardless of logFile — see snapshot
+}
+
+// replayBufferCap bounds ptyBroadcaster.replay — generous enough to catch a
+// newly-attaching client up on realistic recent output (a shell prompt,
+// the last several lines of a command) without letting memory grow
+// unbounded for a long-lived sandbox nobody's had file-based log capture
+// configured for.
+const replayBufferCap = 64 * 1024
+
+func (b *ptyBroadcaster) setCurrent(c net.Conn) {
+	b.mu.Lock()
+	b.current = c
+	b.mu.Unlock()
+}
+
+func (b *ptyBroadcaster) write(p []byte) {
+	if b.logFile != nil {
+		_, _ = b.logFile.Write(p) // best-effort; a log write failure shouldn't affect the live sandbox
+	}
+	b.mu.Lock()
+	b.replay = append(b.replay, p...)
+	if len(b.replay) > replayBufferCap {
+		b.replay = b.replay[len(b.replay)-replayBufferCap:]
+	}
+	c := b.current
+	b.mu.Unlock()
+	if c != nil {
+		_, _ = c.Write(p) // best-effort; a dead connection is handled by acceptLoop's own Read loop noticing it disconnected
+	}
+}
+
+// snapshot returns a copy of whatever's currently in the replay buffer —
+// deliberately NOT sourced from logFile: a direct Isolator caller (e.g.
+// test/integration's own tests) may have LogPath unset entirely (file-based
+// capture disabled), and replay-on-attach needs to work regardless of
+// whether that's configured. Confirmed as a real gap, not hypothetical:
+// TestPTY_LaunchProducesUsablePseudoTerminal constructs a LaunchSpec
+// directly with no LogPath and failed against a file-snapshot-only version
+// of this fix.
+func (b *ptyBroadcaster) snapshot() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]byte, len(b.replay))
+	copy(out, b.replay)
+	return out
+}
+
+// openLogFile opens spec.LogPath for appending, creating its parent
+// directory (DESIGN.md §6: <StateDir>/logs/sandbox/) if needed.
+func openLogFile(path string) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+}
+
+// drainToLog is the ONE continuous reader of ptmx for the shim's whole
+// life — it runs regardless of whether any client is attached, so output
+// produced while unattended (including the entire window while murod is
+// down, since this process survives that) still reaches bcast.logFile.
+// Returns once ptmx closes (bwrap exited); no stop signal needed, unlike
+// the old per-connection relay loop this replaced.
+func drainToLog(ptmx *os.File, bcast *ptyBroadcaster) {
+	buf := make([]byte, 4096)
+	for {
+		n, err := ptmx.Read(buf)
+		if n > 0 {
+			bcast.write(buf[:n])
+		}
+		if err != nil {
+			return // ptmx closed — bwrap exited
+		}
+	}
+}
+
 // acceptLoop serves attach connections one at a time — matching Manager's
 // own "exactly one attacher at a time" semantics (DESIGN.md §12) at the
 // muro level, this only needs to relay one connection at a time too, so
-// relay() is called synchronously rather than per-connection goroutines,
-// which also sidesteps any need to coordinate concurrent access to ptmx.
-func acceptLoop(ln net.Listener, ptmx *os.File) {
+// handleAttachConn() is called synchronously rather than per-connection
+// goroutines.
+func acceptLoop(ln net.Listener, ptmx *os.File, bcast *ptyBroadcaster) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -245,44 +349,39 @@ func acceptLoop(ln net.Listener, ptmx *os.File) {
 			conn.Close()
 			continue
 		}
-		relay(conn, ptmx)
+		handleAttachConn(conn, ptmx, bcast)
 	}
 }
 
-// relay pumps bytes bidirectionally between conn and ptmx until conn
-// disconnects or ptmx closes (bwrap exited). It polls ptmx via a short
-// read deadline, the same pattern internal/control/stream.go's
-// pumpPtyToConn already uses, so a client disconnect stops the
-// output-relay goroutine within ~200ms instead of leaking it until ptmx
-// itself next produces output.
-func relay(conn net.Conn, ptmx *os.File) {
+// handleAttachConn registers conn as bcast's current subscriber (so it
+// receives everything drainToLog reads, live), replays whatever's already
+// been captured so far (so a client attaching after output has already
+// happened still sees it — tmux/screen-style, and the fix for a real
+// regression: drainToLog starts consuming ptmx immediately at launch, so a
+// fast command's early output could already be gone from the live stream
+// by the time a client dials — confirmed via
+// TestPTY_LaunchProducesUsablePseudoTerminal), then relays conn's own
+// input into ptmx (keystrokes) until conn disconnects or a write to ptmx
+// fails.
+//
+// Registered as current BEFORE reading the replay snapshot, deliberately:
+// anything drainToLog writes in the narrow window between registration and
+// the snapshot being taken is delivered twice (once via replay, once live)
+// rather than potentially not at all — duplication is a far more
+// acceptable failure mode here than silently dropping output. Safe to
+// clear bcast's current unconditionally on return: acceptLoop only ever
+// has one of these active at a time, so there's no newer connection it
+// could clobber.
+func handleAttachConn(conn net.Conn, ptmx *os.File, bcast *ptyBroadcaster) {
 	defer conn.Close()
-	stop := make(chan struct{})
+	bcast.setCurrent(conn)
+	defer bcast.setCurrent(nil)
 
-	go func() {
-		buf := make([]byte, 4096)
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			_ = ptmx.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
-			n, err := ptmx.Read(buf)
-			if n > 0 {
-				if _, werr := conn.Write(buf[:n]); werr != nil {
-					return
-				}
-			}
-			if err != nil {
-				if os.IsTimeout(err) {
-					continue
-				}
-				return // ptmx closed — bwrap exited
-			}
+	if snap := bcast.snapshot(); len(snap) > 0 {
+		if _, werr := conn.Write(snap); werr != nil {
+			return
 		}
-	}()
-	defer close(stop)
+	}
 
 	buf := make([]byte, 4096)
 	for {

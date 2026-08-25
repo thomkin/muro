@@ -118,3 +118,40 @@ func (c *Client) Attach(namespace, name string) (io.Reader, io.Writer, error) {
 
 	return c.r, c.conn, nil
 }
+
+// Logs sends a `logs` request and, once the server's JSON handshake
+// confirms OK, returns the connection as a raw io.Reader ready to be
+// copied to the caller's own stdout — the sandbox's captured output
+// (server.go/stream.go), starting with whatever already existed and (if
+// follow is true) continuing with newly-appended content until the server
+// closes the connection or the caller stops reading. One-directional,
+// unlike Attach — nothing the caller writes is ever read by the server for
+// this request type, so Logs deliberately returns only a Reader.
+func (c *Client) Logs(namespace, name string, follow bool) (io.Reader, error) {
+	req := Request{
+		Type:    TypeLogs,
+		Payload: mustMarshal(LogsRequest{Namespace: namespace, Name: name, Follow: follow}),
+	}
+	data, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal logs request: %w", err)
+	}
+	data = append(data, '\n')
+	if _, err := c.conn.Write(data); err != nil {
+		return nil, fmt.Errorf("write logs request: %w", err)
+	}
+
+	line, err := c.r.ReadBytes('\n')
+	if err != nil {
+		return nil, fmt.Errorf("read logs handshake: %w", err)
+	}
+	var resp Response
+	if err := json.Unmarshal(line, &resp); err != nil {
+		return nil, fmt.Errorf("malformed logs handshake: %w", err)
+	}
+	if !resp.OK {
+		return nil, fmt.Errorf("%s", resp.Error)
+	}
+
+	return c.r, nil
+}

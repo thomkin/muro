@@ -139,6 +139,10 @@ func (s *Server) handleConn(conn net.Conn) {
 			s.handleAttach(conn, r, req)
 			return // attach owns the connection for the rest of its life (stream.go)
 		}
+		if req.Type == TypeLogs {
+			s.handleLogs(conn, req)
+			return // logs owns the connection for the rest of its life too (stream.go) — read-only, but still a stream, not a single response
+		}
 
 		resp := s.dispatch(req)
 		if err := writeResponse(conn, resp); err != nil {
@@ -200,8 +204,6 @@ func (s *Server) dispatch(req Request) Response {
 		return s.handleSandboxRestart(req.Payload)
 	case TypeSandboxStop:
 		return s.handleSandboxStop(req.Payload)
-	case TypeLogs:
-		return Response{OK: false, Error: "logs --follow is not implemented yet: log capture/storage isn't wired up"}
 	case TypeBrokerStatus:
 		return s.handleBrokerStatus()
 	case TypeDaemonShutdown:

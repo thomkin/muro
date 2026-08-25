@@ -228,6 +228,11 @@ func (m *Manager) buildLaunchSpec(sb *state.Sandbox, env map[string]string) Laun
 	if sb.Agent == "" {
 		cmd = []string{"/bin/sh"} // fallback; real agent command construction is a later (bwrap/cmd) concern
 	}
+	// LogPath failing to compute (only possible if os.UserHomeDir() fails,
+	// e.g. $HOME unset with no XDG override) is not worth failing the
+	// whole launch over — logs just won't capture anything for this
+	// sandbox, same as if the platform genuinely has no home directory.
+	logPath, _ := config.SandboxLogPath(sb.Namespace, sb.Name)
 	return LaunchSpec{
 		SandboxID: sb.ID,
 		Mounts:    sb.Mounts,
@@ -235,6 +240,7 @@ func (m *Manager) buildLaunchSpec(sb *state.Sandbox, env map[string]string) Laun
 		Env:       env,
 		Cmd:       cmd,
 		PTY:       true,
+		LogPath:   logPath,
 	}
 }
 

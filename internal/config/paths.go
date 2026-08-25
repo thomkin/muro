@@ -40,3 +40,17 @@ func ProfilesDir() (string, error) {
 	}
 	return filepath.Join(cfgDir, "profiles"), nil
 }
+
+// SandboxLogPath returns the per-sandbox captured-output log file path,
+// DESIGN.md §6's convention: <StateDir>/logs/sandbox/<namespace>__<name>.log.
+// Deliberately derived purely from namespace/name rather than stored
+// anywhere in state.json — muro-shim (the writer) and the control server's
+// logs handler (the reader) can each compute the same path independently,
+// with no extra state to keep in sync.
+func SandboxLogPath(namespace, name string) (string, error) {
+	stateDir, err := StateDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(stateDir, "logs", "sandbox", namespace+"__"+name+".log"), nil
+}

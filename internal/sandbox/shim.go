@@ -10,8 +10,9 @@ type ShimSpec struct {
 	BwrapPath  string   `json:"bwrap_path"`
 	Args       []string `json:"args"`
 	PTY        bool     `json:"pty"`
-	SocketPath string   `json:"socket_path"` // Unix socket the shim listens on for attach connections
-	StatusPath string   `json:"status_path"` // where the shim records bwrap's exit status once it's known
+	SocketPath string   `json:"socket_path"`        // Unix socket the shim listens on for attach connections
+	StatusPath string   `json:"status_path"`        // where the shim records bwrap's exit status once it's known
+	LogPath    string   `json:"log_path,omitempty"` // where the shim continuously appends pty output; empty disables log capture
 }
 
 // ShimStatus is written atomically (temp file + rename, same pattern

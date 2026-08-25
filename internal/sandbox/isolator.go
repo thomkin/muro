@@ -22,6 +22,17 @@ type LaunchSpec struct {
 	// directory (shim.go) — it doesn't need to be globally meaningful
 	// beyond "a stable name for this sandbox's on-disk runtime files".
 	SandboxID string
+
+	// LogPath, if set, is where muro-shim continuously appends the
+	// sandbox's pty output for the whole life of the sandbox — independent
+	// of whether anything is attached and independent of murod's own
+	// process lifetime, so `muro logs` has no gap across a murod restart
+	// (DESIGN.md §6's <namespace>__<name>.log convention;
+	// config.SandboxLogPath computes this same path from the CLI/control
+	// side without needing it persisted anywhere). Empty means no log
+	// capture — only used by direct Isolator callers/tests that don't go
+	// through Manager, which always sets it.
+	LogPath string
 }
 
 // Isolator is the sandboxing backend (DESIGN.md §6.1). v1 wraps the bwrap

@@ -1,9 +1,11 @@
 package cli
 
 import (
-	"github.com/spf13/cobra"
+	"io"
+	"os"
+	"os/signal"
 
-	"github.com/thomkin/muro/internal/control"
+	"github.com/spf13/cobra"
 )
 
 var logsFollowFlag bool
@@ -25,11 +27,34 @@ var logsCmd = &cobra.Command{
 		defer c.Close()
 
 		ns, name := splitNamespaceName(args[0])
-		req := control.LogsRequest{Namespace: ns, Name: name, Follow: logsFollowFlag}
-		// The daemon doesn't implement log capture/storage yet
-		// (internal/control's dispatch returns OK:false for this request
-		// type) — this call correctly surfaces that as an error rather
-		// than pretending to stream something that doesn't exist.
-		return c.Call(control.TypeLogs, req, nil)
+		stream, err := c.Logs(ns, name, logsFollowFlag)
+		if err != nil {
+			return err
+		}
+
+		if logsFollowFlag {
+			// Ctrl-C should end a --follow session cleanly, not leave the
+			// process to be killed mid-copy. Closing the connection
+			// unblocks io.Copy below with a read error, which we then
+			// treat as a normal end of stream, not a command failure.
+			sigCh := make(chan os.Signal, 1)
+			signal.Notify(sigCh, os.Interrupt)
+			defer signal.Stop(sigCh)
+			go func() {
+				<-sigCh
+				_ = c.Close()
+			}()
+		}
+
+		_, err = io.Copy(os.Stdout, stream)
+		if err != nil && !logsFollowFlag {
+			// Without --follow the copy is expected to run to a clean EOF;
+			// any error here is a real problem worth surfacing.
+			return err
+		}
+		// With --follow, the stream only ever "ends" via Ctrl-C (above) or
+		// the server/daemon going away — both show up as an io.Copy error
+		// but are the expected way this command finishes, not a failure.
+		return nil
 	},
 }

@@ -163,11 +163,15 @@ type LogsRequest struct {
 	Follow    bool   `json:"follow,omitempty"`
 }
 
-// logs --follow streaming is not implemented yet: log capture/storage
-// (murod writing per-sandbox output to ~/.local/state/muro/logs/, per
-// DESIGN.md §6) isn't wired anywhere in the codebase yet, so dispatch
-// responds with OK:false and a clear error rather than pretending to
-// stream. Implement for real once that piece exists.
+// LogsResponse is the JSON handshake response; if OK, the same connection
+// immediately becomes a one-directional raw byte stream (the sandbox's
+// captured output, muro-shim's continuous pty capture — DESIGN.md §6) —
+// the existing content first, then (if Follow) newly-appended content as
+// it happens, until the server reaches EOF-with-no-more-following or the
+// client disconnects (stream.go's handleLogs).
+type LogsResponse struct {
+	OK bool `json:"ok"`
+}
 
 // --- broker.status ---
 
