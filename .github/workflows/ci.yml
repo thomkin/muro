@@ -33,7 +33,22 @@ jobs:
       - name: Unit tests
         run: go test ./...
 
-      - name: bwrap integration tests
+      - name: Install sandbox/networking host dependencies
         run: |
-          sudo apt-get update && sudo apt-get install -y bubblewrap
-          make test-integration
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap slirp4netns nftables util-linux
+          # Fail loudly here, not silently later: make test-integration's
+          # own `command -v ... || skip` checks (Makefile) exist for local
+          # dev convenience on a machine that legitimately doesn't have
+          # these tools -- in CI, a missing tool after this install step
+          # means something is actually broken and should fail the build,
+          # not quietly report a green run having tested nothing. Bit CI
+          # once before: bwrap alone was installed while slirp4netns/nft
+          # weren't, and the Makefile's graceful skip meant every
+          # integration test silently didn't run, with no visible failure.
+          for bin in bwrap slirp4netns nft nsenter; do
+            command -v "$bin" >/dev/null || { echo "::error::$bin not found on PATH after install"; exit 1; }
+          done
+
+      - name: Integration tests
+        run: make test-integration
