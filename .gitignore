@@ -1,0 +1,6 @@
+/bin/
+/dist/
+*.log
+state.json
+control.sock
+.env
