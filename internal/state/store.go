@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -151,6 +152,19 @@ func (s *Store) List(namespace string) []*Sandbox {
 			out = append(out, sb.Clone())
 		}
 	}
+	// s.sandboxes is a map — Go's iteration order over it is randomized on
+	// purpose, so every call here would otherwise return the same set in a
+	// different order. Harmless for a one-shot `muro status` table, but a
+	// real bug for anything polling this repeatedly and expecting a stable
+	// order (`muro tui`'s Running list visibly reshuffled every ~1.5s poll,
+	// confirmed by direct reproduction) — sorted here, once, for every
+	// caller rather than leaving each one to remember to sort it.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Namespace != out[j].Namespace {
+			return out[i].Namespace < out[j].Namespace
+		}
+		return out[i].Name < out[j].Name
+	})
 	return out
 }
 

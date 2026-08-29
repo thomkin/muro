@@ -78,7 +78,7 @@ func waitForSocket(timeout time.Duration) bool {
 }
 
 func isSocketReachable() bool {
-	c, err := control.Dial(controlSocketPath())
+	c, err := control.Dial(control.ResolveSocketPath())
 	if err != nil {
 		return false
 	}
@@ -91,7 +91,7 @@ var daemonStopCmd = &cobra.Command{
 	Short: "Stop murod",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := control.Dial(controlSocketPath())
+		c, err := control.Dial(control.ResolveSocketPath())
 		if err == nil {
 			defer c.Close()
 			if callErr := c.Call(control.TypeDaemonShutdown, control.DaemonShutdownRequest{}, nil); callErr == nil {
@@ -116,7 +116,7 @@ var daemonStatusCmd = &cobra.Command{
 	Short: "Report whether murod is running",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := control.Dial(controlSocketPath())
+		c, err := control.Dial(control.ResolveSocketPath())
 		if err != nil {
 			if jsonOutput {
 				return RenderJSON(os.Stdout, map[string]any{"running": false})

@@ -80,6 +80,17 @@ func run() int {
 
 	cmd := exec.Command(spec.BwrapPath, spec.Args...)
 
+	// processExited is closed the instant cmd.Wait() (below) returns —
+	// handleAttachConn watches it to close its own connection the moment
+	// the sandboxed process exits, rather than staying blocked forever
+	// reading for client input that will never explain why the session is
+	// already over. Mirrors internal/control/stream.go's pumpPtyToConn
+	// doing the same thing one layer up (murod's control server, relaying
+	// this same pty to `muro sandbox attach`): that fix alone wasn't
+	// enough, since it depends on THIS connection (muro-shim's own attach
+	// socket) actually closing first, which — before this — it never did.
+	processExited := make(chan struct{})
+
 	var ptmx *os.File
 	var ln net.Listener
 	var injectLn net.Listener
@@ -194,7 +205,7 @@ func run() int {
 		// inside relay(), i.e. only while a client happened to be
 		// connected; anything the sandbox wrote while unattended was lost.
 		go drainToLog(ptmx, bcast)
-		go acceptLoop(ln, ptmx, bcast)
+		go acceptLoop(ln, ptmx, bcast, processExited)
 	}
 
 	if injectLn != nil {
@@ -206,6 +217,7 @@ func run() int {
 	installSignalForwarding(cmd)
 
 	waitErr := cmd.Wait()
+	close(processExited)
 	return writeFinalStatus(spec.StatusPath, waitErr)
 }
 
@@ -380,7 +392,7 @@ func drainToLog(ptmx *os.File, bcast *ptyBroadcaster) {
 // muro level, this only needs to relay one connection at a time too, so
 // handleAttachConn() is called synchronously rather than per-connection
 // goroutines.
-func acceptLoop(ln net.Listener, ptmx *os.File, bcast *ptyBroadcaster) {
+func acceptLoop(ln net.Listener, ptmx *os.File, bcast *ptyBroadcaster, processExited <-chan struct{}) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -390,7 +402,7 @@ func acceptLoop(ln net.Listener, ptmx *os.File, bcast *ptyBroadcaster) {
 			conn.Close()
 			continue
 		}
-		handleAttachConn(conn, ptmx, bcast)
+		handleAttachConn(conn, ptmx, bcast, processExited)
 	}
 }
 
@@ -413,7 +425,7 @@ func acceptLoop(ln net.Listener, ptmx *os.File, bcast *ptyBroadcaster) {
 // clear bcast's current unconditionally on return: acceptLoop only ever
 // has one of these active at a time, so there's no newer connection it
 // could clobber.
-func handleAttachConn(conn net.Conn, ptmx *os.File, bcast *ptyBroadcaster) {
+func handleAttachConn(conn net.Conn, ptmx *os.File, bcast *ptyBroadcaster, processExited <-chan struct{}) {
 	defer conn.Close()
 	bcast.setCurrent(conn)
 	defer bcast.setCurrent(nil)
@@ -424,6 +436,26 @@ func handleAttachConn(conn net.Conn, ptmx *os.File, bcast *ptyBroadcaster) {
 		}
 	}
 
+	// The main loop below only notices conn's own client disconnecting —
+	// it has no way to notice the sandboxed process exiting on its own,
+	// since it never reads from ptmx (that's drainToLog/bcast's job, a
+	// separate goroutine). Without this, a client attached when `exit` is
+	// typed inside the sandbox would hang here forever: nothing left to
+	// read, but no signal telling this loop the session is already over —
+	// a real, previously-shipped bug. connDone stops this goroutine the
+	// moment handleAttachConn returns for any OTHER reason (client
+	// disconnected normally), so it doesn't leak past this connection's
+	// own lifetime.
+	connDone := make(chan struct{})
+	defer close(connDone)
+	go func() {
+		select {
+		case <-processExited:
+			_ = conn.Close()
+		case <-connDone:
+		}
+	}()
+
 	buf := make([]byte, 4096)
 	for {
 		n, err := conn.Read(buf)
@@ -433,7 +465,7 @@ func handleAttachConn(conn net.Conn, ptmx *os.File, bcast *ptyBroadcaster) {
 			}
 		}
 		if err != nil {
-			return // client disconnected
+			return // client disconnected, or processExited closed conn above
 		}
 	}
 }

@@ -539,5 +539,482 @@ Resolved in this conversation, not part of SPEC.md's original numbered list:
     unapproved/attacker-controlled host at all. Path-level granularity
     *within* an already-approved host is not being pursued.
 
+15. **Multi-repo git worktree isolation for agent-driven changes** —
+    per-repo `worktree: true` opt-in on the existing `git.repos` schema;
+    muro creates and owns the worktree, `main`/the real checkout is never
+    reachable from inside the sandbox, and merging back is a host-side-only,
+    human-confirmed action (§15).
+16. **`muro tui`** — a Bubble Tea terminal UI, delivering SPEC.md §5's
+    always-anticipated "just another client of the same control API": a
+    live-updating list of running sandboxes and launchable profiles,
+    attach-and-switch in place of three separate one-shot commands (§16).
+
 Nothing left open from SPEC.md §10's original list or from this
 conversation.
+
+## 16. `muro tui` — Terminal UI
+
+**What it is.** A new `muro tui` subcommand (`internal/cli/tui.go` +
+`internal/tui`), not a new binary — `murod` is untouched. Two tabs,
+switched with `Tab`: *Running* (a permanent split — a list of sandboxes on
+the left, a live console pane for whichever one is highlighted on the
+right, both visible at once) and *Profiles* (`config.ListProfiles()`, no
+daemon round-trip, same as `muro profile list`; `Enter` prompts for a name
+and launches + auto-attaches). The list itself is polled via
+`Client.Call(TypeStatus, ...)` every ~1.5s (`commands.go`'s `pollInterval`)
+— `Client.Call` is strictly one-shot, no `--watch` request type exists
+despite §7 musing about one, and adding server-push would mean touching
+`murod`, which this feature deliberately avoids.
+
+**Revision note:** an earlier version of this section described a simpler
+"list, then attach full-screen" design (`Enter` handing the whole terminal
+to the sandboxed agent via `tea.Exec`, `Ctrl-P Ctrl-Q` handing it back to
+the list). That shipped first and worked, but direct feedback was specific:
+the list should stay visible *while* watching/interacting with an agent,
+not be replaced by it — see whoever's running, click, get its console right
+there, switch easily. That's a materially different mechanism (below), not
+a layout tweak, so this section was rewritten rather than amended in place.
+
+**Mechanism: an embedded terminal emulator, not a byte passthrough.** A
+pane that sits permanently next to a list can't hand the whole terminal to
+the sandboxed agent the way `muro sandbox attach` does — Bubble Tea has to
+keep rendering the list *at the same time* as the agent's own output. That
+means actually parsing the agent's raw terminal output (cursor moves,
+colors, its own redraws) into a screen buffer muro owns, then drawing that
+into the pane — `internal/tui/pane.go`, backed by `github.com/hinshun/
+vt10x` (confirmed real and usable: pkg.go.dev, packaged for Debian/Fedora/
+Ubuntu). `vt10x.Terminal` embeds `io.Writer`, so the same raw attach stream
+`Client.Attach` already returns is fed straight in (`io.Copy(term, r)`);
+`renderPane` reads the resulting cell grid (`Cell(x, y) Glyph{Char, Mode,
+FG, BG}`) and redraws it with `lipgloss` styling on a fixed ~80ms tick
+(`paneTickCmd`), independent of and much faster than the status-list poll.
+One real wrinkle, confirmed against the actual vt10x source: the attribute
+bits in `Glyph.Mode` (bold/underline/reverse/...) are unexported constants
+— `pane.go` replicates the same bit *values* locally, pinned by comment to
+the exact vt10x version in `go.mod`, since there's no public name to import
+them under. A future vt10x release renumbering them would silently
+misrender attributes, not break the build — accepted, not fixed, since
+there's no upstream export to depend on instead.
+
+**Only one live attach connection at a time, still.** Moving the list
+selection closes whatever was previously followed and opens a fresh attach
+for the newly-highlighted sandbox — `internal/tui/pane.go`'s `session` /
+`switchToCmd`. This is not "one pane visible of many live" — it's still
+DESIGN.md §12's exclusive-attacher-per-sandbox model, just re-opened
+automatically on every highlight instead of requiring an explicit
+attach/detach cycle. Rapid selection changes are handled: `sessionOpenedMsg`
+carries the target it was opened for, and the model tracks the most
+recently *requested* target (`pendingTarget`) separately from the currently
+*applied* one (`sessTarget`) — a slow dial that resolves after a faster,
+later one already won is recognized as stale and its session is closed
+immediately rather than clobbering the newer one.
+
+**Keyboard focus, not a mode dialog.** The list owns keyboard focus by
+default (arrows navigate; typed characters go nowhere). `Enter` moves focus
+into the console — every keystroke, including arrows, is then forwarded to
+the attached agent as raw bytes. `Ctrl-P Ctrl-Q` is not special-cased
+client-side at all: it's forwarded like any other keystroke, and
+`internal/control/stream.go`'s existing `detachScanner` recognizes it
+server-side and ends the stream — exactly what already happens for `muro
+sandbox attach`, completely unchanged. The pane's redraw tick is what
+notices the resulting death (`session.Live()`, a non-blocking channel
+check — no `*tea.Program` reference needed inside `pane.go` to push a
+message) and returns focus to the list, freezing the pane on its last
+frame rather than clearing it; nothing auto-reattaches on its own, since
+that would silently reconnect right after an operator's own explicit
+detach.
+
+**Reconstructing raw bytes Bubble Tea already discarded.** Forwarding
+keystrokes to the agent needs the *original* bytes a key was parsed from,
+but Bubble Tea's input loop only hands `Update` the parsed `tea.KeyMsg`,
+not the raw bytes — `internal/tui/keys.go`'s `keyBytes` rebuilds them.
+Confirmed against Bubble Tea's actual source: every C0 control key's
+`KeyType` numeric value *is* its raw control byte (`keyNUL=0` ... `keyESC=
+27` ... `keyDEL=127`), so those need no lookup table at all; the "other
+keys" block (arrows, home/end, etc.) uses negative `KeyType` values with no
+such relationship, mapped by hand to their standard xterm/ANSI escape
+sequences for the keys realistic to press while typing into a coding
+agent's own prompt. F-keys and exotic ctrl+shift+arrow combos fall through
+to nil (silently dropped) — a deliberate scoping choice, not an oversight.
+
+**Two real bugs found and fixed via live pty-driven testing** (not
+hypothetical — reproduced against the actual compiled binary, since a
+full-screen program can't be meaningfully verified by reading code alone):
+
+1. **Attaching to a non-running sandbox silently did nothing.** A stopped/
+   crashed sandbox's attach stream just EOFs immediately — treated as a
+   clean end, not an error, so the operator saw no explanation at all.
+   Fixed with an explicit state check (`isAttachable`, mirrors
+   `internal/sandbox.isActive`'s running/reload-pending/restarting set)
+   before ever attempting to follow a highlighted sandbox, showing a clear
+   inline error instead.
+
+2. **In the earlier `tea.Exec`-based design, one attach/detach cycle
+   permanently broke all keyboard input, including quit.** `ptyio.Pump`
+   (`internal/ptyio/ptyio.go`, still used by the standalone `muro sandbox
+   attach` command) returns as soon as EITHER direction of the byte-pump
+   ends, not both — when the remote side ends first (the normal detach
+   case), the *other* goroutine, still blocked reading `os.Stdin`, was
+   never unblocked. Harmless for the standalone attach command (the whole
+   process exits immediately after `Pump` returns, reaping the leak with
+   it); fatal for a TUI that keeps running afterward and hands `os.Stdin`
+   back to Bubble Tea — the leaked goroutine kept winning the race for
+   every subsequent keystroke and discarding it. Fixed in `Pump` itself:
+   `in` is wrapped in a `muesli/cancelreader.CancelReader` (already an
+   indirect dependency via Bubble Tea, now direct), explicitly canceled
+   once either side finishes, so no reader is ever left dangling against a
+   shared fd after `Pump` returns. This fix predates and is independent of
+   the later move away from `tea.Exec` for the Running tab — it stays
+   correct and load-bearing for `muro sandbox attach`, which still uses
+   `Pump` directly.
+
+**Explicitly deferred, not attempted here: pty resize forwarding.**
+Confirmed nothing in muro forwards terminal resize anywhere, for any attach
+path — `internal/sandbox/bwrap.go`'s `OpenPTY` doc comment: *"it does not
+set an initial terminal size... the attach path is expected to send a
+resize once a real terminal is attached"*, never implemented. The console
+pane renders whatever size the sandbox's pty already defaults to (matching
+`muro sandbox attach`'s existing, already-working behavior) — cropped if
+the pane is smaller, blank past the edge if larger — rather than the agent
+laying out cleanly at the pane's actual width. Real resize support would
+mean reaching all the way through `murod` into `muro-shim` (which actually
+owns the pty, not `murod` itself): a new dedicated Unix socket from
+`muro-shim` mirroring the existing `InjectSocketPath` pattern exactly
+(`internal/sandbox/shim.go` + `cmd/muro-shim/main.go`), carrying
+`TIOCSWINSZ` requests, plus a new control API request type for the CLI
+side to report its own terminal resizes. Real, well-scoped, separate work —
+deliberately not bundled into this pass so the interaction model could be
+validated first.
+
+**Shared code extracted to avoid an import cycle.** `internal/cli/tui.go`
+constructs and runs the Bubble Tea program, so `internal/cli` must import
+`internal/tui` — meaning `internal/tui` cannot import anything from
+`internal/cli` back (raw-mode handling, the byte pump, and control-socket-
+path resolution all used to live there, unexported). Both moved to lower
+packages both sides can depend on without cycling: `internal/ptyio`
+(`SetRawMode`, `Pump`) and `control.ResolveSocketPath()` (`internal/
+control/socket.go`) — `muro sandbox attach` and `internal/cli/daemon.go`
+were updated to call these instead of duplicating them, not left on two
+diverging implementations.
+
+**Three more real bugs, found through actual use of the shipped split
+pane** (not the earlier pty-driven test harness — direct user feedback
+after living with it):
+
+1. **The Running list visibly reshuffled on every ~1.5s poll.**
+   `internal/state.Store.List` built its result by ranging directly over
+   its internal `map[string]*Sandbox` — Go's map iteration order is
+   deliberately randomized, so two calls back-to-back could (and did)
+   return the same sandboxes in a different order. Harmless for a one-shot
+   `muro status` table; a real, visible bug for anything polling it
+   continuously. Fixed at the source — `List` now sorts by namespace, then
+   name, before returning — so every caller (`muro status`, `muro ps`,
+   `muro tui`) gets a stable order, not just the TUI working around it
+   itself.
+
+2. **No reliable way back to the list once inside the console.** Ctrl-P
+   Ctrl-Q (server-side detach, unchanged) is a two-key control-character
+   chord — outside muro's control, a real terminal or multiplexer sitting
+   between the operator and this process can intercept or remap either
+   half of it before the process ever sees the bytes, and in practice this
+   left the operator stuck in console focus with no way back. Fixed by
+   giving `Esc` a client-side-only meaning: it always returns keyboard
+   focus to the list immediately, no server round-trip, no ambiguity —
+   *without* closing the session (`internal/tui/model.go`'s
+   `handleKey`), unlike Ctrl-P Ctrl-Q which still ends the attach stream
+   for real. Both are documented in the footer hint now; Esc is the
+   reliable one.
+
+   **Superseded by further real-use feedback**: Esc turned out to be a bad
+   choice of key precisely because it's *not* rare — Claude Code (and other
+   CLI agents) use Esc themselves, for cancel/clear, so making it a
+   client-side-only interception meant every Esc press was silently eaten
+   by the TUI and never reached the attached agent at all. Replaced with
+   `F2`: Bubble Tea's own key encoding already never forwards F-keys to the
+   agent (`keys.go`'s `keyBytes`: "unrecognized ... dropped, not guessed
+   at"), so repurposing one as muro's own "back to the list" command
+   changes nothing about what the agent used to receive — the single-key
+   reliability Esc was chosen for, without Esc's collision with the agent's
+   own keybindings. Esc itself now forwards through like any ordinary
+   keystroke again.
+
+3. **No scrollback — output that scrolled past was just gone.** vt10x
+   itself tracks no history beyond its current screen (confirmed against
+   the actual source: `scrollUp`/`scrollDown` just shift lines within the
+   fixed-size grid, discarding what scrolls off — there's no separate
+   history buffer to read back). Added a capped (512KB) raw-byte capture
+   per session (`session.history`, `pane.go`), fed alongside — not instead
+   of — the live `vt10x.Terminal`. Scrolling replays an earlier *prefix*
+   of that buffer into a throwaway `vt10x.Terminal` and renders whatever
+   screen that produces (`renderScrollback`/`scrollCutoff`) — the byte
+   offset to replay up to is found by counting `\n` bytes backward from
+   the end, since vt10x tracks no line index either. This is an
+   approximation, not a perfect reconstruction, and deliberately so: a
+   full-screen redrawing app doesn't have a meaningful scrollback concept
+   to reconstruct in the first place, matching how real terminals also
+   suspend scrollback during alt-screen mode. `PageUp`/`PageDown` scroll
+   by one pane-height each while console-focused (intercepted, not
+   forwarded to the agent — a real F-key-style tradeoff, same spirit as
+   `keys.go`'s existing scoping); typing snaps back to live automatically,
+   since interacting with the agent means you want to see it react.
+
+   **Extended with mouse wheel support**: PgUp/PgDn alone meant scrolling
+   only worked from the keyboard — the instinctive first thing anyone tries
+   on a long console is the mouse wheel, and until this fix it silently did
+   nothing (`muro tui`'s `tea.NewProgram` never enabled mouse mode at all).
+   Fixed by adding `tea.WithMouseCellMotion()` (`internal/cli/tui.go`) and a
+   `tea.MouseMsg` case in `Update` (`handleMouse`, `internal/tui/model.go`):
+   wheel over the console pane scrolls it via the same `scrollByLines`
+   primitive PgUp/PgDn now share (`scrollBack` is just `scrollByLines(dir *
+   pageHeight)`), a few lines per notch rather than a full page for finer
+   granularity; wheel while a list has focus moves its selection exactly
+   like arrow keys, including following the Running-tab selection into a
+   live attach the same way arrow keys do. Verified live via the pty-driven
+   harness, sending real SGR mouse-wheel escape sequences
+   (`\x1b[<64;x;yM`/`\x1b[<65;x;yM`) against the compiled binary attached to
+   a real sandbox: the scroll indicator appeared and cleared exactly as
+   expected, and wheel-on-the-list moved the highlighted sandbox.
+
+4. **No way to start a stopped sandbox from inside `muro tui`.** With every
+   real sandbox stopped (the common case between work sessions), Enter on a
+   Running-tab item just showed "not running — nothing to attach to" — a
+   dead end, since the list only ever showed sandboxes that already exist,
+   with no separate affordance to bring one back up. `muro sandbox restart`
+   already works on a stopped sandbox, not just a running one needing its
+   config refreshed (confirmed live) — so Enter on a non-attachable item now
+   calls it (`restartCmd`, `internal/tui/commands.go`) and auto-attaches
+   once it comes back (`restartedMsg`'s handler in `model.go`'s `Update`),
+   the same one-key affordance Enter already had for launching a brand-new
+   sandbox from the Profiles tab, instead of erroring. Footer hint updated
+   to `enter: type into it (or start, if stopped)`. Verified live via the
+   pty-driven harness against a real stopped sandbox (`default/memtest`):
+   Enter flips its state to `running` and the pane header/footer both
+   correctly name it as the newly-attached target.
+
+## 15. Multi-Repo Git Worktree Isolation for Agent-Driven Changes
+
+**Problem.** Two agents (or two sandboxes from the same profile) working
+against the same project must never be able to edit the same files at the
+same moment — that's not a "which agent wins" question, it's silent data
+loss. A project is also frequently *more than one* repo (frontend, backend,
+shared libs, each its own checkout) mounted at different paths in the same
+sandbox, so the fix has to work per-repo, not per-sandbox.
+
+**Why this isn't solved with file locking.** Live locking between
+independent processes is fragile (a crashed agent leaves a stale lock; a
+lock doesn't stop a reader from seeing a half-written file mid-edit) and
+doesn't compose with §6.1's "deny by default" mount model anyway. `git
+worktree` gives the same guarantee structurally instead: each agent gets its
+own working tree on its own branch, sharing one `.git` — two agents
+literally cannot touch the same working-tree files, because each has its own
+copy. Any real overlap between two agents' work surfaces later as an
+ordinary git merge conflict, which is what git is for, rather than as
+corrupted files nobody notices until later.
+
+**Schema — extends §10's `GitRepoPolicy` (`internal/config/gitpolicy.go`),
+does not replace it.** `GitPolicy.Repos` already supports multiple repos per
+profile (it did before this feature existed — see correction below), each
+scoping the git tool-proxy's branch/remote restrictions. Worktree isolation
+is a new, explicit **opt-in** on top of that existing list, not implied by
+merely appearing in it:
+
+```json
+"git": {
+  "repos": [
+    {
+      "host": "~/projects/frontend",
+      "allowed_remotes": ["origin"],
+      "worktree": true,
+      "mount_path": "/workspace/frontend"
+    },
+    {
+      "host": "~/projects/backend",
+      "worktree": true,
+      "mount_path": "/workspace/backend"
+    }
+  ]
+}
+```
+
+- `worktree` (new field, default `false`): opts this repo entry into the
+  behavior below. **Not implicit from being listed under `git.repos`** —
+  correcting course from earlier discussion in this conversation, since
+  `git.repos` already had an existing, narrower meaning (tool-proxy
+  restriction on a repo the profile mounts directly and unmodified) that a
+  read-only/inspection-only repo entry may still legitimately want without
+  ever getting an isolated, mergeable branch.
+- `mount_path` (new field, **required when `worktree: true`, rejected
+  otherwise**): the sandbox-internal path the generated worktree is mounted
+  at. This inverts the existing rule for non-worktree entries — today,
+  `Host` must be covered by a `mounts:` entry the profile itself declares
+  (`ValidateProfile`, unchanged for `worktree: false`). For `worktree: true`
+  entries, muro generates that mount itself, from the worktree it creates,
+  so declaring a matching `mounts:` entry by hand would be redundant and is
+  rejected by validation the same way an overlapping `tools:`/`mounts:` pair
+  already is (§10).
+- `allowed_branches` **must be left empty (or omitted) when `worktree:
+  true`, and is rejected by validation if set** — corrected during
+  implementation. `allowed_branches` restricts which branch a `commit`/
+  `push` may land on (`internal/gitproxy`'s `CheckCurrentBranch`), but a
+  worktree's branch is muro-generated (`agent/<namespace>/<name>`) — a
+  profile author can't know that name in advance to write a matching
+  pattern, and a wrong or missing one would silently block every commit the
+  agent makes. `murod` computes the effective single-branch allowlist
+  itself at launch/restart time (see "the actual isolation boundary"
+  below), from the frontend example above that's exactly
+  `["agent/<namespace>/<name>"]`, nothing else. `allowed_remotes` stays
+  fully author-controlled and may legitimately be empty or omitted, as the
+  `backend` example above shows — merging back is a host-side `murod`
+  operation, not a sandbox push, so "no remote access at all, pure local
+  commits" is the common, normal case, not a pointless empty declaration.
+
+**Worktree creation — host-side, before the sandbox ever starts.** On
+`muro run` (and on `restart --from-profile`, §9), for every `worktree: true`
+repo entry, `murod`:
+1. Runs `git worktree add <path> -b agent/<namespace>/<name> <base-branch>`
+   against the real repo at `Host` — the sandboxed agent process never runs
+   this itself.
+2. Mounts that worktree path — not `Host` — at `mount_path` inside the
+   sandbox, read-write.
+3. `<base-branch>` is whatever `HEAD` resolves to on `Host` at launch time
+   (typically `main`), not separately configurable in v1.
+
+Step 1 is **idempotent** — added during implementation, since this section
+didn't originally spell it out, but it's the only reading consistent with
+the feature's own purpose: if the worktree path already exists on disk (a
+`restart --from-profile` reusing the same sandbox ID's own worktree), `git
+worktree add` is skipped entirely and the existing worktree, with whatever
+commits the agent already made in it, is reused untouched. Without this, a
+restart would either fail outright (the path already exists) or — far
+worse if naively "fixed" by wiping and recreating — silently destroy the
+agent's in-progress work. `<base-branch>` itself is remembered across a
+restart via a small muro-owned sidecar file next to the worktree directory
+(git has no first-class "this branch's base was X" relationship to query
+back later), not re-derived from `Host`'s HEAD a second time.
+
+**The actual isolation boundary — corrected during implementation.** An
+earlier draft of this section claimed the sandbox "has no reachable path to
+the real checkout or `.git` at all," full stop. That's not quite true, and
+worth being precise about: a git worktree's own `.git` is a pointer file
+into the real repo's `.git/worktrees/<name>/` — git commands run *from* a
+worktree structurally require that shared metadata to be reachable, so
+"nothing about the real repo is ever reachable by any means" is not
+achievable while keeping git worktrees functional at all, and isn't actually
+what this feature relies on for its guarantee anyway. The real mechanism
+(confirmed via a genuine, real-bwrap end-to-end test,
+`internal/sandbox/worktree_integration_test.go`): a `worktree: true` repo's
+`GitRepoPolicy` is resolved with `Host` rewritten to the worktree's own
+path, and — exactly like every other git-proxy-mediated repo already works,
+`worktree: true` or not — the sandboxed process itself never gets a real
+`git` binary or any `.git` path mounted at all; it only has
+`muro-toolstub` on `PATH`, which forwards argv+cwd over a Unix socket to
+`murod`. The real `git` process that touches `.git/worktrees/...` runs
+**on the host, inside murod, unsandboxed** — the same trusted-execution
+model this project's git tool-proxy has always used (§ "Tool Restriction,"
+`internal/gitproxy`'s package doc). What the sandbox genuinely cannot do,
+by construction, is: see or modify the real repo's *working-tree files*
+(only the worktree's own checked-out copy is ever mounted), run any git
+subcommand outside the daemon's fixed allowlist, or commit/push anywhere
+but its own generated branch (`CheckCurrentBranch`/`AllowedBranches`,
+already-existing gitproxy policy, unchanged by this feature). That's the
+actual, buildable guarantee — not filesystem invisibility of `.git`, which
+was never really the mechanism doing the protecting even before this
+feature existed.
+
+**Where worktrees live.** `~/.local/state/muro/sandboxes/<id>/worktrees/
+<last-path-component-of-mount_path>/` — under `StateDir`, muro-owned end to
+end, the same shape as the existing per-sandbox private-dir storage
+(`.../sandboxes/<id>/private/...`, §6). Deliberately **not** next to the
+real repo: creating scratch space there would need write access to the
+user's actual project directories for something that's explicitly disposable
+("only for the development purposes of the AI," not a browsable artifact the
+way `~/.config/muro/profiles/` is meant to be) and risks colliding with the
+user's own hand-created worktrees. Keying the directory name off
+`mount_path`'s last component (not `Host`'s) is safe because `mount_path`
+collisions across a sandbox's mounts are already rejected by the same
+validation used for §10's `tools:`/`mounts:` overlap check.
+
+**Surfaced to the user, not just to the agent.** `muro sandbox show`
+(§9) gains a `worktrees` field: one entry per `worktree: true` repo,
+listing `mount_path`, branch name, and whether it has commits not yet
+merged to `<base-branch>` — so a human never has to rely on the agent
+volunteering this in conversation to know what branch a sandbox is on.
+
+**Merging back — host-side only, human-confirmed, squash.**
+`muro sandbox merge <agent-name> [--repo <mount_path>]` (`--repo` required
+only when a sandbox has more than one `worktree: true` entry):
+1. Requires at least one real commit on the worktree's branch — dirty,
+   uncommitted state alone is never "ready."
+2. Shows the diff against `<base-branch>` and a proposed commit message,
+   opened in `$EDITOR` for the operator to edit or approve outright —
+   reusing exactly the pattern `muro profile edit` (§9) already uses
+   (factored into a shared `openInEditor` helper), rather than inventing a
+   second editor-invocation convention. **The proposed message is the
+   agent's own last commit message on the worktree branch** (`git log -1
+   --format=%B`) — corrected during implementation: muro has no channel for
+   an agent to hand back a structured "summary," it's an opaque pty-driven
+   process, but the accompanying `AGENT.md` convention already asks the
+   agent to leave a clear final commit as its last action before saying
+   it's done, so that commit's own message is the real, buildable source —
+   nothing new required. The diff is shown as `#`-prefixed comment lines
+   below the draft message, exactly `git commit`'s own editor convention.
+3. On confirmation: `git merge --squash` into `<base-branch>` plus one
+   commit with the operator's final message — the worktree branch's own
+   possibly-messy incremental history never lands on `<base-branch>`, only
+   this one commit does. **Preconditions, added during implementation:**
+   the real checkout at `Host` must already be on `<base-branch>` with a
+   fully clean `git status` before anything is touched. This isn't
+   optional — a git worktree can never share a checked-out branch with
+   another worktree (a hard git constraint), so the squash-merge has to run
+   in whichever single working tree currently has `<base-branch>` checked
+   out, normally the user's own primary checkout — `muro sandbox merge`
+   never switches branches or stashes on the operator's behalf to work
+   around this; it refuses with a clear error naming what to fix instead.
+4. Only *after* a clean merge: prune the worktree (`git worktree remove`)
+   and delete the branch. A conflicting merge aborts outright — no
+   auto-resolution attempted, `git reset --hard HEAD` restores the real
+   checkout to exactly its pre-attempt state (safe, since step 3's
+   precondition just verified there was nothing else to lose) — leaving the
+   worktree and branch exactly as they were; the operator resolves it by
+   hand on the host, or by re-attaching the sandbox to have the agent
+   reconcile it, then retries.
+
+**Delete guard — extends the existing pattern, doesn't invent a new one.**
+`muro sandbox delete` already refuses an active sandbox and already cleans
+up a stopped sandbox's private dirs (§6) on success. It gains one more
+check: refuse if any `worktree: true` repo has commits on its branch not yet
+merged into `<base-branch>` — the existing `--yes` flag (confirming deletion
+of sandbox metadata/logs) is **not** sufficient to also discard unmerged
+code, since those are different classes of risk. Discarding on purpose
+requires a distinctly-named `--discard-worktree <mount_path>`, once per
+repo, so it can never be an accidental side effect of routine sandbox
+cleanup. A worktree with nothing unmerged (never committed to, or already
+merged) is pruned unconditionally as part of a normal delete, the same way
+`RemovePrivateDirs` already runs unconditionally — nothing worth protecting
+means nothing to ask permission for.
+
+**Merging a mount out from under a still-running sandbox.** `muro sandbox
+merge` doesn't require the sandbox to be stopped first — the merge itself
+is a host-side git operation, independent of the sandbox process. But if
+the sandbox IS currently active, its already-launched mount table still
+includes the just-pruned worktree path; rather than leaving that silently
+stale, the sandbox is marked `reload-pending` (the same existing state
+`Update` already uses for a mount change that can't be hot-applied, §6.3)
+so it's visible in `muro status`/`sandbox show` that a restart is needed.
+
+**Agent-side convention (not enforced, courtesy only — belongs in
+`AGENT.md`/`CLAUDE.md`, not in muro itself; §10's `Instructions`/`Skills`
+fields already mount exactly this kind of content into a sandbox):** tell
+the agent to mention its branch name early in conversation (redundant with
+`sandbox show`, but nicer live UX), and — when it believes a change is
+complete — to write a clear final summary that becomes the proposed merge
+commit message, then say plainly that it cannot merge itself and is waiting
+on the operator. This is honesty about a boundary that already exists
+mechanically (the agent has no reachable path to `<base-branch>` or a merge
+command), not a rule it has to remember to obey.
+
+**What's explicitly unchanged.** A `git.repos` entry with `worktree`
+omitted or `false` keeps exactly today's behavior — `Host` must be covered
+by a hand-declared `mounts:` entry, no worktree is created, no
+`mount_path`/`sandbox merge`/delete-guard behavior applies. Nothing about
+existing profiles' git policy blocks changes unless they opt in.

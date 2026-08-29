@@ -303,3 +303,268 @@ func TestValidateProfile_WildcardToolNeverCollides(t *testing.T) {
 		t.Errorf("wildcard tool should never collide with a mount, got: %v", err)
 	}
 }
+
+func TestValidateProfile_PrivateDirsAccepted(t *testing.T) {
+	p := &Profile{
+		Name:        "private-dirs-ok",
+		Agent:       "claude",
+		Mounts:      []Mount{{Host: "/tmp", SandboxPath: "/workspace", Mode: "rw"}},
+		PrivateDirs: []string{"/home/agent/.claude/projects"},
+	}
+	if err := ValidateProfile(p); err != nil {
+		t.Errorf("a private_dirs entry with no collision should be accepted, got: %v", err)
+	}
+}
+
+func TestValidateProfile_DuplicatePrivateDirRejected(t *testing.T) {
+	p := &Profile{
+		Name:        "dup-private-dir",
+		Agent:       "claude",
+		PrivateDirs: []string{"/data", "/data"},
+	}
+	if err := ValidateProfile(p); err == nil {
+		t.Error("expected a duplicate private_dirs entry to be rejected")
+	}
+}
+
+func TestValidateProfile_PrivateDirCollidesWithMountRejected(t *testing.T) {
+	p := &Profile{
+		Name:        "collide-mount",
+		Agent:       "claude",
+		Mounts:      []Mount{{Host: "/tmp", SandboxPath: "/data", Mode: "ro"}},
+		PrivateDirs: []string{"/data"},
+	}
+	if err := ValidateProfile(p); err == nil {
+		t.Error("expected a private_dirs entry colliding with a mounts: target to be rejected")
+	}
+}
+
+func TestValidateProfile_PrivateDirCollidesWithToolRejected(t *testing.T) {
+	p := &Profile{
+		Name:        "collide-tool",
+		Agent:       "claude",
+		Tools:       []Tool{{Host: "/usr/bin/git", As: "git"}},
+		PrivateDirs: []string{"/usr/local/bin/git"},
+	}
+	if err := ValidateProfile(p); err == nil {
+		t.Error("expected a private_dirs entry colliding with a tools: target to be rejected")
+	}
+}
+
+func TestValidateProfile_GitPolicyRepoNotCoveredByMountsRejected(t *testing.T) {
+	p := &Profile{
+		Name:   "git-uncovered",
+		Agent:  "claude",
+		Mounts: []Mount{{Host: "/home/user/other", SandboxPath: "/workspace", Mode: "rw"}},
+		Git: GitPolicy{
+			Repos: []GitRepoPolicy{
+				{Host: "/home/user/projects/foo", AllowedBranches: []string{"ai"}, AllowedRemotes: []string{"origin"}},
+			},
+		},
+	}
+	if err := ValidateProfile(p); err == nil {
+		t.Error("expected an error for a git policy repo not covered by any mounts: entry")
+	}
+}
+
+func TestValidateProfile_GitPolicyRepoCoveredByMountsAccepted(t *testing.T) {
+	p := &Profile{
+		Name:   "git-covered",
+		Agent:  "claude",
+		Mounts: []Mount{{Host: "/home/user/projects/foo", SandboxPath: "/workspace", Mode: "rw"}},
+		Git: GitPolicy{
+			Repos: []GitRepoPolicy{
+				{Host: "/home/user/projects/foo", AllowedBranches: []string{"ai"}, AllowedRemotes: []string{"origin"}},
+			},
+		},
+	}
+	if err := ValidateProfile(p); err != nil {
+		t.Errorf("expected a mount-covered git policy repo to be accepted, got: %v", err)
+	}
+}
+
+func TestValidateProfile_GitPolicyEmptyBranchesOrRemotesRejected(t *testing.T) {
+	base := Profile{
+		Name:   "git-empty",
+		Agent:  "claude",
+		Mounts: []Mount{{Host: "/home/user/projects/foo", SandboxPath: "/workspace", Mode: "rw"}},
+	}
+
+	noBranches := base
+	noBranches.Git = GitPolicy{Repos: []GitRepoPolicy{
+		{Host: "/home/user/projects/foo", AllowedRemotes: []string{"origin"}},
+	}}
+	if err := ValidateProfile(&noBranches); err == nil {
+		t.Error("expected an error for a repo policy with no allowed_branches")
+	}
+
+	noRemotes := base
+	noRemotes.Git = GitPolicy{Repos: []GitRepoPolicy{
+		{Host: "/home/user/projects/foo", AllowedBranches: []string{"ai"}},
+	}}
+	if err := ValidateProfile(&noRemotes); err == nil {
+		t.Error("expected an error for a repo policy with no allowed_remotes")
+	}
+}
+
+func TestValidateProfile_WorktreeRepoAccepted(t *testing.T) {
+	p := &Profile{
+		Name:  "worktree-ok",
+		Agent: "claude",
+		Git: GitPolicy{
+			Repos: []GitRepoPolicy{
+				{Host: "/home/user/projects/foo", Worktree: true, MountPath: "/workspace/foo"},
+			},
+		},
+	}
+	if err := ValidateProfile(p); err != nil {
+		t.Errorf("expected a worktree: true repo with a mount_path to be accepted, got: %v", err)
+	}
+}
+
+func TestValidateProfile_WorktreeRepoNotRequiredToBeCoveredByMounts(t *testing.T) {
+	// The whole point of worktree: true is that the sandbox never sees
+	// Host directly — muro generates the mount itself, so unlike a
+	// non-worktree entry, Host must NOT need a matching mounts: entry.
+	p := &Profile{
+		Name:  "worktree-uncovered-ok",
+		Agent: "claude",
+		Git: GitPolicy{
+			Repos: []GitRepoPolicy{
+				{Host: "/home/user/projects/nowhere-mounted", Worktree: true, MountPath: "/workspace/foo"},
+			},
+		},
+	}
+	if err := ValidateProfile(p); err != nil {
+		t.Errorf("expected a worktree repo to be accepted without any covering mounts: entry, got: %v", err)
+	}
+}
+
+func TestValidateProfile_WorktreeRepoEmptyAllowedRemotesAccepted(t *testing.T) {
+	// Unlike a non-worktree entry, empty allowed_remotes is legitimate for
+	// a worktree — merging back is a host-side muro operation, not a
+	// sandbox push, so "no remote access at all" is a normal, valid
+	// configuration, not a pointless empty declaration.
+	p := &Profile{
+		Name:  "worktree-no-remotes-ok",
+		Agent: "claude",
+		Git: GitPolicy{
+			Repos: []GitRepoPolicy{
+				{Host: "/home/user/projects/foo", Worktree: true, MountPath: "/workspace/foo"},
+			},
+		},
+	}
+	if err := ValidateProfile(p); err != nil {
+		t.Errorf("expected empty allowed_remotes on a worktree repo to be accepted, got: %v", err)
+	}
+}
+
+func TestValidateProfile_WorktreeRepoMissingMountPathRejected(t *testing.T) {
+	p := &Profile{
+		Name:  "worktree-no-mountpath",
+		Agent: "claude",
+		Git:   GitPolicy{Repos: []GitRepoPolicy{{Host: "/home/user/projects/foo", Worktree: true}}},
+	}
+	if err := ValidateProfile(p); err == nil {
+		t.Error("expected an error for a worktree: true repo with no mount_path")
+	}
+}
+
+func TestValidateProfile_WorktreeRepoWithAllowedBranchesRejected(t *testing.T) {
+	// allowed_branches is computed automatically from the sandbox's own
+	// generated branch (DESIGN.md §15 refinement 1) — a profile author
+	// declaring it themselves can't know that name in advance, so it's
+	// rejected rather than silently ignored.
+	p := &Profile{
+		Name:  "worktree-with-branches",
+		Agent: "claude",
+		Git: GitPolicy{
+			Repos: []GitRepoPolicy{
+				{Host: "/home/user/projects/foo", Worktree: true, MountPath: "/workspace/foo", AllowedBranches: []string{"main"}},
+			},
+		},
+	}
+	if err := ValidateProfile(p); err == nil {
+		t.Error("expected an error for a worktree: true repo with allowed_branches set")
+	}
+}
+
+func TestValidateProfile_NonWorktreeRepoWithMountPathRejected(t *testing.T) {
+	p := &Profile{
+		Name:   "non-worktree-with-mountpath",
+		Agent:  "claude",
+		Mounts: []Mount{{Host: "/home/user/projects/foo", SandboxPath: "/workspace", Mode: "rw"}},
+		Git: GitPolicy{
+			Repos: []GitRepoPolicy{
+				{Host: "/home/user/projects/foo", AllowedBranches: []string{"ai"}, AllowedRemotes: []string{"origin"}, MountPath: "/workspace/foo"},
+			},
+		},
+	}
+	if err := ValidateProfile(p); err == nil {
+		t.Error("expected an error for a non-worktree repo that also sets mount_path")
+	}
+}
+
+func TestValidateProfile_WorktreeMountPathCollidesWithMountRejected(t *testing.T) {
+	p := &Profile{
+		Name:   "worktree-mount-collision",
+		Agent:  "claude",
+		Mounts: []Mount{{Host: "/tmp", SandboxPath: "/workspace/foo", Mode: "rw"}},
+		Git: GitPolicy{
+			Repos: []GitRepoPolicy{
+				{Host: "/home/user/projects/foo", Worktree: true, MountPath: "/workspace/foo"},
+			},
+		},
+	}
+	if err := ValidateProfile(p); err == nil {
+		t.Error("expected an error when a worktree's mount_path collides with a mounts: entry")
+	}
+}
+
+func TestValidateProfile_WorktreeMountPathCollidesWithToolRejected(t *testing.T) {
+	p := &Profile{
+		Name:  "worktree-tool-collision",
+		Agent: "claude",
+		Tools: []Tool{{Host: "/usr/bin/node", As: "node"}},
+		Git: GitPolicy{
+			Repos: []GitRepoPolicy{
+				{Host: "/home/user/projects/foo", Worktree: true, MountPath: toolRoot + "/node"},
+			},
+		},
+	}
+	if err := ValidateProfile(p); err == nil {
+		t.Error("expected an error when a worktree's mount_path collides with a tools: entry")
+	}
+}
+
+func TestValidateProfile_WorktreeMountPathCollidesWithPrivateDirRejected(t *testing.T) {
+	p := &Profile{
+		Name:        "worktree-privatedir-collision",
+		Agent:       "claude",
+		PrivateDirs: []string{"/workspace/foo"},
+		Git: GitPolicy{
+			Repos: []GitRepoPolicy{
+				{Host: "/home/user/projects/foo", Worktree: true, MountPath: "/workspace/foo"},
+			},
+		},
+	}
+	if err := ValidateProfile(p); err == nil {
+		t.Error("expected an error when a worktree's mount_path collides with a private_dirs entry")
+	}
+}
+
+func TestValidateProfile_TwoWorktreeReposSameMountPathRejected(t *testing.T) {
+	p := &Profile{
+		Name:  "worktree-worktree-collision",
+		Agent: "claude",
+		Git: GitPolicy{
+			Repos: []GitRepoPolicy{
+				{Host: "/home/user/projects/foo", Worktree: true, MountPath: "/workspace/shared"},
+				{Host: "/home/user/projects/bar", Worktree: true, MountPath: "/workspace/shared"},
+			},
+		},
+	}
+	if err := ValidateProfile(p); err == nil {
+		t.Error("expected an error when two worktree repos both set the same mount_path")
+	}
+}

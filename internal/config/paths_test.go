@@ -55,14 +55,40 @@ func TestStateDir_HomeFallback(t *testing.T) {
 	}
 }
 
-func TestProfilesDir(t *testing.T) {
+func TestProfilesDir_UnderConfigDirByDefault(t *testing.T) {
+	t.Setenv("MURO_PROFILES_DIR", "")
 	t.Setenv("XDG_CONFIG_HOME", "/tmp/xdgcfg")
 	got, err := ProfilesDir()
 	if err != nil {
 		t.Fatalf("ProfilesDir() error: %v", err)
 	}
-	want := "/tmp/xdgcfg/muro/profiles"
+	want := filepath.Join("/tmp/xdgcfg", "muro", "profiles")
 	if got != want {
 		t.Errorf("ProfilesDir() = %q, want %q", got, want)
+	}
+}
+
+func TestProfilesDir_HomeFallbackWhenNoXDG(t *testing.T) {
+	t.Setenv("MURO_PROFILES_DIR", "")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", "/tmp/fakehome")
+	got, err := ProfilesDir()
+	if err != nil {
+		t.Fatalf("ProfilesDir() error: %v", err)
+	}
+	want := filepath.Join("/tmp/fakehome", ".config", "muro", "profiles")
+	if got != want {
+		t.Errorf("ProfilesDir() = %q, want %q", got, want)
+	}
+}
+
+func TestProfilesDir_EnvOverride(t *testing.T) {
+	t.Setenv("MURO_PROFILES_DIR", "/tmp/custom-profiles")
+	got, err := ProfilesDir()
+	if err != nil {
+		t.Fatalf("ProfilesDir() error: %v", err)
+	}
+	if got != "/tmp/custom-profiles" {
+		t.Errorf("ProfilesDir() = %q, want /tmp/custom-profiles", got)
 	}
 }

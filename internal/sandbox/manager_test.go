@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -43,6 +44,12 @@ func (p *fakeProxy) RegisterSandboxAddr(sandboxID, addr string) {
 
 func newTestManager(t *testing.T) (*Manager, *fakeIsolator, *fakePublisher) {
 	t.Helper()
+	// resolveSandboxFieldsFromProfile calls BundleDocsMounts, which stats
+	// config.ProfileBundleDir(profile.Name) unconditionally — without this,
+	// every manager test would touch the real host's ~/muro/profiles/<name>
+	// (harmless read, but nondeterministic if a real profile of the same
+	// name happens to exist there).
+	t.Setenv("MURO_PROFILES_DIR", t.TempDir())
 	store := state.NewStore(filepath.Join(t.TempDir(), "state.json"))
 	iso := newFakeIsolator()
 	pub := &fakePublisher{}
@@ -59,6 +66,33 @@ func testProfile(name string) *config.Profile {
 		Agent:         "claude",
 		AllowURLs:     []string{"https://api.anthropic.com"},
 		RestartPolicy: "never",
+	}
+}
+
+// TestRun_AgentArgsFlowIntoLaunchCmd proves a profile's agent_args (e.g.
+// Claude Code's own --dangerously-skip-permissions) actually reach the
+// launched process's argv, not just get stored — buildLaunchSpec's cmd
+// used to be a single-element []string{sb.Agent} with no way to add
+// arguments at all.
+func TestRun_AgentArgsFlowIntoLaunchCmd(t *testing.T) {
+	mgr, iso, _ := newTestManager(t)
+
+	p := testProfile("p1")
+	p.Agent = "/usr/bin/claude"
+	p.AgentArgs = []string{"--dangerously-skip-permissions", "--add-dir", "/workspace"}
+	if _, err := mgr.Run(p, "agent-1", "default"); err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	got := iso.launched[len(iso.launched)-1].Cmd
+	want := []string{"/usr/bin/claude", "--dangerously-skip-permissions", "--add-dir", "/workspace"}
+	if len(got) != len(want) {
+		t.Fatalf("Cmd = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("Cmd[%d] = %q, want %q (full: %v)", i, got[i], want[i], got)
+		}
 	}
 }
 
@@ -267,6 +301,30 @@ func TestRestartPolicy_NeverEndsInCrashed(t *testing.T) {
 	assertHasEvent(t, pub, "default/agent-1:crashed")
 }
 
+// TestRestartPolicy_NeverEndsInStoppedOnCleanExit closes a real bug:
+// watchLoop's final branch used to set StateCrashed unconditionally,
+// regardless of exit code — so a sandbox that exited cleanly on its own
+// (e.g. the agent/shell ran `exit`) was misreported as crashed, exactly
+// the same way `muro sandbox stop` would report it, even though nothing
+// went wrong.
+func TestRestartPolicy_NeverEndsInStoppedOnCleanExit(t *testing.T) {
+	mgr, iso, pub := newTestManager(t)
+
+	p := testProfile("p1")
+	p.RestartPolicy = "never"
+	if _, err := mgr.Run(p, "agent-1", "default"); err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	iso.lastHandle().finish(0, nil) // clean exit
+	waitForState(t, mgr, "default", "agent-1", state.StateStopped)
+
+	if iso.handleCount() != 1 {
+		t.Errorf("handleCount = %d, want 1 (never policy must not relaunch)", iso.handleCount())
+	}
+	assertHasEvent(t, pub, "default/agent-1:stopped")
+}
+
 func TestRestartPolicy_OnFailureRetriesThenExhausts(t *testing.T) {
 	mgr, iso, pub := newTestManager(t)
 	mgr.maxRestartAttempts = 2
@@ -288,6 +346,328 @@ func TestRestartPolicy_OnFailureRetriesThenExhausts(t *testing.T) {
 		t.Errorf("handleCount = %d, want 3 (2 restarts + original launch)", iso.handleCount())
 	}
 	assertHasEvent(t, pub, "default/agent-1:restart-exhausted")
+}
+
+// TestRestart_FromProfilePicksUpMountChange proves the actual point of
+// `muro sandbox restart --from-profile`: editing a profile's mounts on
+// disk and then restarting a sandbox already running from it picks up the
+// new mount, unlike a plain restart (which only reapplies whatever the
+// sandbox already had stored, ignoring the profile file entirely).
+func TestRestart_FromProfilePicksUpMountChange(t *testing.T) {
+	mgr, iso, _ := newTestManager(t)
+
+	p := testProfile("p1")
+	if err := config.SaveProfile(p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Run(p, "agent-1", "default"); err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	sb, _ := mgr.store.Get("default", "agent-1")
+	if len(sb.Mounts) != 0 {
+		t.Fatalf("precondition: expected no mounts yet, got %+v", sb.Mounts)
+	}
+
+	// Edit the profile ON DISK, the same way `muro profile mount add` does
+	// — mgr.Run's own in-memory p is deliberately not touched, since the
+	// whole point is proving Restart re-reads the file.
+	p.Mounts = append(p.Mounts, config.Mount{Host: "/usr/bin", SandboxPath: "/usr/bin", Mode: "ro"})
+	if err := config.SaveProfile(p); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mgr.Restart("default", "agent-1", true); err != nil {
+		t.Fatalf("Restart(fromProfile=true) error: %v", err)
+	}
+
+	sb, _ = mgr.store.Get("default", "agent-1")
+	if len(sb.Mounts) != 1 || sb.Mounts[0].SandboxPath != "/usr/bin" {
+		t.Errorf("Mounts after restart --from-profile = %+v, want the newly added /usr/bin mount", sb.Mounts)
+	}
+	if iso.handleCount() != 2 {
+		t.Errorf("handleCount = %d, want 2 (original launch + restart relaunch)", iso.handleCount())
+	}
+}
+
+// TestRestart_FromProfilePicksUpAgentArgsChange is TestRestart_FromProfilePicksUpMountChange's
+// sibling for agent_args specifically, since AgentArgs is a separate field
+// resolveSandboxFieldsFromProfile/Restart has to thread through on its own.
+func TestRestart_FromProfilePicksUpAgentArgsChange(t *testing.T) {
+	mgr, iso, _ := newTestManager(t)
+
+	p := testProfile("p1")
+	if err := config.SaveProfile(p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Run(p, "agent-1", "default"); err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	p.AgentArgs = []string{"--dangerously-skip-permissions"}
+	if err := config.SaveProfile(p); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mgr.Restart("default", "agent-1", true); err != nil {
+		t.Fatalf("Restart(fromProfile=true) error: %v", err)
+	}
+
+	got := iso.launched[len(iso.launched)-1].Cmd
+	if len(got) != 2 || got[1] != "--dangerously-skip-permissions" {
+		t.Errorf("Cmd after restart --from-profile = %v, want agent followed by --dangerously-skip-permissions", got)
+	}
+}
+
+// TestRestart_WithoutFromProfileIgnoresProfileChange proves the default
+// (no flag) behavior is unchanged: a plain restart must NOT pick up a
+// profile edit, only whatever the sandbox already has stored.
+func TestRestart_WithoutFromProfileIgnoresProfileChange(t *testing.T) {
+	mgr, _, _ := newTestManager(t)
+
+	p := testProfile("p1")
+	if err := config.SaveProfile(p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Run(p, "agent-1", "default"); err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	p.Mounts = append(p.Mounts, config.Mount{Host: "/usr/bin", SandboxPath: "/usr/bin", Mode: "ro"})
+	if err := config.SaveProfile(p); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mgr.Restart("default", "agent-1", false); err != nil {
+		t.Fatalf("Restart error: %v", err)
+	}
+
+	sb, _ := mgr.store.Get("default", "agent-1")
+	if len(sb.Mounts) != 0 {
+		t.Errorf("Mounts after plain restart = %+v, want unchanged (empty) — restart without --from-profile must not read the profile file", sb.Mounts)
+	}
+}
+
+func TestRun_GeneratesUniqueSessionIDPerSandbox(t *testing.T) {
+	mgr, _, _ := newTestManager(t)
+
+	sb1, err := mgr.Run(testProfile("p1"), "agent-1", "default")
+	if err != nil {
+		t.Fatalf("Run agent-1 error: %v", err)
+	}
+	sb2, err := mgr.Run(testProfile("p1"), "agent-2", "default")
+	if err != nil {
+		t.Fatalf("Run agent-2 error: %v", err)
+	}
+	if sb1.SessionID == "" || sb2.SessionID == "" {
+		t.Fatalf("expected non-empty SessionID on both, got %q and %q", sb1.SessionID, sb2.SessionID)
+	}
+	if sb1.SessionID == sb2.SessionID {
+		t.Errorf("two different sandboxes got the same SessionID: %q", sb1.SessionID)
+	}
+}
+
+func TestRestart_FromProfilePreservesSessionID(t *testing.T) {
+	mgr, _, _ := newTestManager(t)
+
+	p := testProfile("p1")
+	if err := config.SaveProfile(p); err != nil {
+		t.Fatal(err)
+	}
+	sb, err := mgr.Run(p, "agent-1", "default")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	original := sb.SessionID
+	if original == "" {
+		t.Fatal("expected a non-empty SessionID after Run")
+	}
+
+	if err := mgr.Restart("default", "agent-1", true); err != nil {
+		t.Fatalf("Restart(fromProfile=true) error: %v", err)
+	}
+
+	after, _ := mgr.store.Get("default", "agent-1")
+	if after.SessionID != original {
+		t.Errorf("SessionID changed across restart --from-profile: %q -> %q, want unchanged", original, after.SessionID)
+	}
+}
+
+func TestRun_AgentArgsSessionIDTemplateSubstitution(t *testing.T) {
+	mgr, iso, _ := newTestManager(t)
+
+	p := testProfile("p1")
+	p.Agent = "/usr/bin/claude"
+	p.AgentArgs = []string{"--session-id", SessionIDTemplateToken}
+	sb, err := mgr.Run(p, "agent-1", "default")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	got := iso.launched[len(iso.launched)-1].Cmd
+	want := []string{"/usr/bin/claude", "--session-id", sb.SessionID}
+	if len(got) != len(want) {
+		t.Fatalf("Cmd = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("Cmd[%d] = %q, want %q (full: %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+func TestRun_InstructionsAndSkillsProduceExpectedMounts(t *testing.T) {
+	mgr, iso, _ := newTestManager(t)
+
+	dir := t.TempDir()
+	instructionsFile := dir + "/AGENT.md"
+	if err := os.WriteFile(instructionsFile, []byte("# expert\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	skillFile := dir + "/deploy.md"
+	if err := os.WriteFile(skillFile, []byte("# deploy\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	hostHome, err := os.UserHomeDir()
+	if err != nil {
+		t.Skipf("no host home dir available in this environment: %v", err)
+	}
+
+	p := testProfile("p1")
+	p.Instructions = instructionsFile
+	p.Skills = []string{skillFile}
+	if _, err := mgr.Run(p, "agent-1", "default"); err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	mounts := iso.launched[len(iso.launched)-1].Mounts
+	wantInstr := hostHome + "/.claude/CLAUDE.md"
+	wantSkill := hostHome + "/.claude/skills/deploy/SKILL.md"
+	var gotInstr, gotSkill bool
+	for _, m := range mounts {
+		if m.SandboxPath == wantInstr && m.Host == instructionsFile && m.Mode == "ro" {
+			gotInstr = true
+		}
+		if m.SandboxPath == wantSkill && m.Host == skillFile && m.Mode == "ro" {
+			gotSkill = true
+		}
+	}
+	if !gotInstr {
+		t.Errorf("expected an instructions mount at %q, got %+v", wantInstr, mounts)
+	}
+	if !gotSkill {
+		t.Errorf("expected a skill mount at %q, got %+v", wantSkill, mounts)
+	}
+}
+
+func TestRun_PrivateDirsProduceIsolatedRWMounts(t *testing.T) {
+	mgr, iso, _ := newTestManager(t)
+	mgr.SetStateDir(t.TempDir())
+
+	p := testProfile("p1")
+	p.PrivateDirs = []string{"/home/agent/.claude/projects"}
+	sb, err := mgr.Run(p, "agent-1", "default")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	if len(sb.PrivateDirs) != 1 || sb.PrivateDirs[0] != "/home/agent/.claude/projects" {
+		t.Errorf("sb.PrivateDirs = %v, want the one configured path", sb.PrivateDirs)
+	}
+
+	found := false
+	for _, m := range iso.launched[len(iso.launched)-1].Mounts {
+		if m.SandboxPath == "/home/agent/.claude/projects" {
+			found = true
+			if m.Mode != "rw" {
+				t.Errorf("private dir mount mode = %q, want rw", m.Mode)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected a mount for the configured private dir, got %+v", iso.launched[len(iso.launched)-1].Mounts)
+	}
+}
+
+func TestDelete_RejectsActiveSandbox(t *testing.T) {
+	mgr, _, _ := newTestManager(t)
+
+	if _, err := mgr.Run(testProfile("p1"), "agent-1", "default"); err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if err := mgr.Delete("default", "agent-1", nil); err == nil {
+		t.Fatal("expected Delete to reject a still-running sandbox, got nil error")
+	}
+	if _, ok := mgr.store.Get("default", "agent-1"); !ok {
+		t.Error("sandbox record should still exist after a rejected Delete")
+	}
+}
+
+func TestDelete_RemovesStoppedSandboxAndItsPrivateDirs(t *testing.T) {
+	mgr, _, _ := newTestManager(t)
+	stateDir := t.TempDir()
+	mgr.SetStateDir(stateDir)
+
+	p := testProfile("p1")
+	p.PrivateDirs = []string{"/data"}
+	sb, err := mgr.Run(p, "agent-1", "default")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	privateHostDir := filepath.Join(stateDir, "sandboxes", sb.ID, "private", "data")
+	if _, err := os.Stat(privateHostDir); err != nil {
+		t.Fatalf("precondition: expected private dir to exist: %v", err)
+	}
+
+	if err := mgr.Stop("default", "agent-1"); err != nil {
+		t.Fatalf("Stop error: %v", err)
+	}
+	if err := mgr.Delete("default", "agent-1", nil); err != nil {
+		t.Fatalf("Delete error: %v", err)
+	}
+
+	if _, ok := mgr.store.Get("default", "agent-1"); ok {
+		t.Error("sandbox record should be gone after Delete")
+	}
+	if _, err := os.Stat(privateHostDir); !os.IsNotExist(err) {
+		t.Errorf("expected private dir to be removed after Delete, stat err = %v", err)
+	}
+}
+
+func TestDelete_UnknownSandboxIsAnError(t *testing.T) {
+	mgr, _, _ := newTestManager(t)
+	if err := mgr.Delete("default", "never-existed", nil); err == nil {
+		t.Fatal("expected an error deleting a sandbox that was never created, got nil")
+	}
+}
+
+// TestRestart_PlainRestartPreservesEnvFromOriginalRun closes a real bug: a
+// plain `muro sandbox restart` (no --from-profile) used to always launch
+// with an EMPTY environment — buildLaunchSpec took Env as a parameter that
+// Run passed profile.Env into, but Restart (without fromProfile) and
+// watchLoop's crash-relaunch always passed nil, silently losing every
+// profile env var on every restart after the first. Confirmed live: a
+// profile env var a launch depended on for correctness
+// (CLAUDE_CODE_BUBBLEWRAP) was present on the original `muro run` but
+// vanished on the very next plain `muro sandbox restart`.
+func TestRestart_PlainRestartPreservesEnvFromOriginalRun(t *testing.T) {
+	mgr, iso, _ := newTestManager(t)
+
+	p := testProfile("p1")
+	p.Env = map[string]string{"SOME_VAR": "some-value"}
+	if _, err := mgr.Run(p, "agent-1", "default"); err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	if err := mgr.Restart("default", "agent-1", false); err != nil {
+		t.Fatalf("Restart error: %v", err)
+	}
+
+	got := iso.launched[len(iso.launched)-1].Env
+	if got["SOME_VAR"] != "some-value" {
+		t.Errorf("Env after plain restart = %+v, want SOME_VAR=some-value preserved from the original Run", got)
+	}
 }
 
 func TestRestartPolicy_AlwaysRetriesAfterCleanExit(t *testing.T) {
@@ -447,7 +827,7 @@ func TestRestart_ForceDetachesExistingAttach(t *testing.T) {
 		t.Fatalf("Attach error: %v", err)
 	}
 
-	if err := mgr.Restart("default", "agent-1"); err != nil {
+	if err := mgr.Restart("default", "agent-1", false); err != nil {
 		t.Fatalf("Restart error: %v", err)
 	}
 	if iso.handleCount() != 2 {
@@ -475,7 +855,7 @@ func TestRestart_DoesNotDoubleRestartViaStaleWatcher(t *testing.T) {
 		t.Fatalf("Run error: %v", err)
 	}
 
-	if err := mgr.Restart("default", "agent-1"); err != nil {
+	if err := mgr.Restart("default", "agent-1", false); err != nil {
 		t.Fatalf("Restart error: %v", err)
 	}
 

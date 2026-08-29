@@ -44,12 +44,18 @@ func shellMounts() []config.Mount {
 	return mounts
 }
 
-// testProxyAddr matches cmd/murod's real fixed proxy listen address
-// (proxyListenAddr in cmd/murod/main.go) — tests that need a real listener
-// there (network_test.go) bind exactly this address; tests that don't care
-// about network reachability just need Launch's Stage 2/3 setup to succeed
-// against *some* well-formed address, which this equally serves.
-const testProxyAddr = "127.0.0.1:18080"
+// testProxyAddr is deliberately NOT cmd/murod's real fixed proxy listen
+// address (127.0.0.1:18080, proxyListenAddr in cmd/murod/main.go) — it used
+// to be, but that collides with a real murod actually running on a dev
+// machine (e.g. as a systemd --user service), which silently swallows this
+// package's own proxy's bind error (network_test.go's startTestProxy) and
+// makes the sandboxed test script talk to the real production daemon
+// instead, producing a confusing false failure (a clean 403 from the wrong
+// server, not a real allowlist bug). Confirmed as the actual root cause of
+// exactly that failure during this project's own development. Tests that
+// don't care about network reachability just need Launch's Stage 2/3 setup
+// to succeed against *some* well-formed address, which this equally serves.
+const testProxyAddr = "127.0.0.1:18280"
 
 func newIsolator(t *testing.T) *sandbox.BwrapIsolator {
 	t.Helper()
@@ -342,6 +348,67 @@ func TestPTY_LaunchProducesUsablePseudoTerminal(t *testing.T) {
 	got := string(buf[:n])
 	if !contains(got, "pty-hello") {
 		t.Errorf("expected pty output to contain %q, got %q", "pty-hello", got)
+	}
+
+	if _, err := h.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+}
+
+// TestPTY_AttachUnblocksWhenSandboxExits closes a real, previously-shipped
+// bug: cmd/muro-shim's handleAttachConn only ever noticed its OWN client
+// disconnecting, never the sandboxed process exiting on its own (`exit`
+// typed inside an attached shell) — since it never reads ptmx itself, only
+// drainToLog does, in a separate goroutine. A client attached at the moment
+// the sandbox exited would see the connection just hang forever, with
+// nothing left to read and no signal explaining why. This is deliberately
+// a real end-to-end test against actual muro-shim + bwrap — a unit test
+// against internal/control's own fake isolator (which stands in a bare
+// socketpair for "the pty") cannot catch this, since the bug lives one
+// layer further down, inside muro-shim itself, not in murod's control
+// server.
+func TestPTY_AttachUnblocksWhenSandboxExits(t *testing.T) {
+	iso := newIsolator(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	h, err := iso.Launch(ctx, sandbox.LaunchSpec{
+		Mounts: shellMounts(),
+		Cmd:    []string{"/bin/sh", "-c", "sleep 0.3; exit 0"},
+		PTY:    true,
+	})
+	if err != nil {
+		t.Fatalf("Launch with PTY: %v", err)
+	}
+	defer iso.Stop(h)
+
+	pty, ok := h.Stdio()
+	if !ok {
+		t.Fatal("expected Stdio() ok=true for a PTY launch")
+	}
+
+	// A generous deadline, deliberately much larger than the ~0.3s the
+	// sandboxed process actually takes to exit: if the fix works, Read
+	// returns promptly once the process exits, well before this fires. If
+	// it regresses, Read blocks until this deadline instead — a timeout,
+	// not a close — which the elapsed-time assertion below distinguishes
+	// from a real fix even though both end up returning *an* error.
+	deadliner, hasDeadline := pty.(interface{ SetReadDeadline(time.Time) error })
+	if !hasDeadline {
+		t.Fatal("expected a real bwrap-launched sandbox's Stdio() to support read deadlines")
+	}
+	_ = deadliner.SetReadDeadline(time.Now().Add(5 * time.Second))
+
+	start := time.Now()
+	buf := make([]byte, 256)
+	_, err = pty.Read(buf)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected Read to eventually return an error/EOF once the sandboxed process exited, got nil")
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("Read took %v to return after the sandboxed process exited (~0.3s) — it hit the 5s deadline instead of the connection actually closing, the hang bug is back", elapsed)
 	}
 
 	if _, err := h.Wait(); err != nil {

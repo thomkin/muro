@@ -3,8 +3,8 @@ Description=muro-broker (standalone mochi-mqtt broker for muro)
 After=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/muro-broker
+ExecStart=%h/.local/bin/muro-broker
 Restart=on-failure
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

@@ -14,6 +14,7 @@ var (
 	runNameFlag      string
 	runNamespaceFlag string
 	runAgentFlag     string
+	runAgentArgFlags []string
 )
 
 func init() {
@@ -21,6 +22,7 @@ func init() {
 	runCmd.Flags().StringVar(&runNameFlag, "name", "", "agent name, unique within its namespace (required)")
 	runCmd.Flags().StringVar(&runNamespaceFlag, "namespace", "", "namespace (default \"default\")")
 	runCmd.Flags().StringVar(&runAgentFlag, "agent", "", "override the profile's agent command")
+	runCmd.Flags().StringArrayVar(&runAgentArgFlags, "agent-arg", nil, "override the profile's whole agent_args list for this run, repeatable and in order")
 	_ = runCmd.MarkFlagRequired("profile")
 	_ = runCmd.MarkFlagRequired("name")
 	rootCmd.AddCommand(runCmd)
@@ -51,6 +53,7 @@ var runCmd = &cobra.Command{
 			Name:      runNameFlag,
 			Namespace: runNamespaceFlag,
 			Agent:     runAgentFlag,
+			AgentArgs: runAgentArgFlags,
 		}
 		var view control.SandboxView
 		if err := c.Call(control.TypeSandboxRun, req, &view); err != nil {

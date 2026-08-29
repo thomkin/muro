@@ -43,6 +43,41 @@ type LaunchSpec struct {
 	// pub/sub not configured at all), in which case no such mount is
 	// added and the sandbox simply has no agent socket.
 	AgentSocketPath string
+
+	// ToolSocketPath, if set, is the host-side Unix socket murod listens on
+	// for this sandbox's git tool-proxy requests (toolsocket.go) —
+	// BwrapIsolator mounts it into the sandbox at a fixed internal path
+	// (ToolSocketMountPath, bwrap.go). Empty means the tool-proxy is
+	// disabled for this sandbox (no git policy configured), in which case
+	// neither this mount nor the git stub mount below is added.
+	ToolSocketPath string
+
+	// GitStubHostPath, if set, is the host path to the git tool-proxy stub
+	// binary (cmd/muro-toolstub) — mounted read-only at GitStubMountPath,
+	// shadowing any real git binary. Resolved by BwrapIsolator.Launch
+	// itself (via toolstubPath()) when ToolSocketPath is set, not by the
+	// caller — a direct Isolator caller normally leaves this empty and
+	// lets Launch fill it in.
+	GitStubHostPath string
+
+	// AudioRuntimeDir, if set, is the host's $XDG_RUNTIME_DIR — presence
+	// (non-empty) signals that this sandbox's Mounts already includes the
+	// PipeWire/PulseAudio socket bind mounts (audio.go's AudioMounts,
+	// applied by Manager before Launch, same "resolved once by Manager,
+	// not by BwrapIsolator" pattern as GitPolicy). BwrapIsolator uses this
+	// only to set XDG_RUNTIME_DIR as a default sandbox env var (buildArgs)
+	// pointing at the identical path the mounts already landed at — a
+	// profile that explicitly sets its own XDG_RUNTIME_DIR in Env still
+	// wins, same precedence as HTTP_PROXY/HTTPS_PROXY below. Empty means
+	// audio passthrough is disabled for this sandbox.
+	AudioRuntimeDir string
+
+	// SessionID, if set, is the sandbox's stable per-instance UUID
+	// (state.Sandbox.SessionID) — BwrapIsolator uses this only to set
+	// MURO_SESSION_ID as a default sandbox env var (buildArgs), same
+	// override precedence as AudioRuntimeDir/HTTP_PROXY above (a profile's
+	// own explicit MURO_SESSION_ID in Env still wins).
+	SessionID string
 }
 
 // Isolator is the sandboxing backend (DESIGN.md §6.1). v1 wraps the bwrap

@@ -79,13 +79,18 @@ func sandboxScaffoldPaths() []string {
 	return []string{"/proc", "/dev", "/tmp"}
 }
 
-// expandHome resolves a leading "~" the same way a shell would, for
-// comparison purposes only — muro's own mount handling doesn't expand "~"
-// itself (a profile's Mount.Host is passed to bwrap as written), but a
-// profile author writing "~/whatever" clearly means it relative to their
-// home directory, and validation needs to see through that to catch
-// "~" (home root) itself being mounted rw.
-func expandHome(path string) string {
+// ExpandHome resolves a leading "~" the same way a shell would, using the
+// REAL CURRENT user's home directory (os.UserHomeDir(), evaluated at call
+// time, on whatever machine this runs) — the mechanism that makes a
+// profile authored on one machine ("~/.claude/...") resolve correctly on a
+// different one, rather than needing every profile to hardcode
+// "/home/thomas/...". Applied everywhere a profile carries a host or
+// sandbox path: Mount.Host, Mount.SandboxPath, Tool.Host, Instructions,
+// Skills entries, and GitRepoPolicy.Host (internal/sandbox's ResolveMounts
+// and friends) — as well as here, for validation's own dangerous-root
+// comparisons, which is what this used to be scoped to exclusively before
+// the wider expansion existed.
+func ExpandHome(path string) string {
 	if path != "~" && !strings.HasPrefix(path, "~/") {
 		return path
 	}
@@ -208,7 +213,7 @@ func ValidateProfile(p *Profile) error {
 		}
 
 		if m.Mode == "rw" {
-			hostAbs := expandHome(m.Host)
+			hostAbs := ExpandHome(m.Host)
 			for _, dangerous := range dangerousHostRoots() {
 				// Symmetric: either direction of overlap is rejected. A
 				// mount narrower than a dangerous root (e.g. StateDir's own
@@ -242,6 +247,100 @@ func ValidateProfile(p *Profile) error {
 					p.Name, m.Host, m.SandboxPath, scaffold)
 			}
 		}
+	}
+
+	privateDirSeen := make(map[string]bool, len(p.PrivateDirs))
+	for _, pd := range p.PrivateDirs {
+		if privateDirSeen[pd] {
+			return fmt.Errorf("profile %q: private_dirs entry %q is listed more than once", p.Name, pd)
+		}
+		privateDirSeen[pd] = true
+		if t, ok := toolTargets[pd]; ok {
+			return fmt.Errorf("profile %q: private_dirs entry %q and tool %q (as %q) both target the same sandbox path",
+				p.Name, pd, t.Host, t.As)
+		}
+		for _, m := range p.Mounts {
+			if m.SandboxPath == pd {
+				return fmt.Errorf("profile %q: private_dirs entry %q and mount %q both target the same sandbox path",
+					p.Name, pd, m.Host)
+			}
+		}
+	}
+
+	for _, repo := range p.Git.Repos {
+		if repo.Worktree {
+			if repo.MountPath == "" {
+				return fmt.Errorf("profile %q: git policy repo %q has worktree: true but no mount_path — "+
+					"a worktree needs a sandbox-internal path to be mounted at",
+					p.Name, repo.Host)
+			}
+			if len(repo.AllowedBranches) != 0 {
+				return fmt.Errorf("profile %q: git policy repo %q has worktree: true and also sets "+
+					"allowed_branches %v — this is computed automatically from the sandbox's own "+
+					"agent/<namespace>/<name> branch; leave allowed_branches empty for a worktree entry",
+					p.Name, repo.Host, repo.AllowedBranches)
+			}
+			if t, ok := toolTargets[repo.MountPath]; ok {
+				return fmt.Errorf("profile %q: git policy repo %q's mount_path %q and tool %q (as %q) both target the same sandbox path",
+					p.Name, repo.Host, repo.MountPath, t.Host, t.As)
+			}
+			for _, m := range p.Mounts {
+				if m.SandboxPath == repo.MountPath {
+					return fmt.Errorf("profile %q: git policy repo %q's mount_path %q and mount %q both target the same sandbox path — "+
+						"muro generates this mount itself from the worktree, a hand-declared mounts: entry here would be redundant",
+						p.Name, repo.Host, repo.MountPath, m.Host)
+				}
+			}
+			if privateDirSeen[repo.MountPath] {
+				return fmt.Errorf("profile %q: git policy repo %q's mount_path %q and a private_dirs entry both target the same sandbox path",
+					p.Name, repo.Host, repo.MountPath)
+			}
+			continue
+		}
+
+		if repo.MountPath != "" {
+			return fmt.Errorf("profile %q: git policy repo %q sets mount_path %q but worktree is not true — "+
+				"mount_path only applies to a worktree: true entry",
+				p.Name, repo.Host, repo.MountPath)
+		}
+
+		hostAbs := ExpandHome(repo.Host)
+		covered := false
+		for _, m := range p.Mounts {
+			if pathCoversOrEquals(ExpandHome(m.Host), hostAbs) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			return fmt.Errorf("profile %q: git policy repo %q is not covered by any mounts: entry — "+
+				"the git tool-proxy translates a sandbox's cwd to a host path via the mounts: table, "+
+				"so a repo outside every mounted path could never be reached",
+				p.Name, repo.Host)
+		}
+		if len(repo.AllowedBranches) == 0 {
+			return fmt.Errorf("profile %q: git policy repo %q has no allowed_branches — "+
+				"an empty-but-present repo entry allows nothing; omit the repo entirely instead if that's the intent",
+				p.Name, repo.Host)
+		}
+		if len(repo.AllowedRemotes) == 0 {
+			return fmt.Errorf("profile %q: git policy repo %q has no allowed_remotes — "+
+				"an empty-but-present repo entry allows nothing; omit the repo entirely instead if that's the intent",
+				p.Name, repo.Host)
+		}
+	}
+
+	// Two worktree entries must not target the same mount_path.
+	seenWorktreeMountPaths := make(map[string]string, len(p.Git.Repos))
+	for _, repo := range p.Git.Repos {
+		if !repo.Worktree {
+			continue
+		}
+		if existing, ok := seenWorktreeMountPaths[repo.MountPath]; ok {
+			return fmt.Errorf("profile %q: git policy repos %q and %q both set mount_path %q",
+				p.Name, existing, repo.Host, repo.MountPath)
+		}
+		seenWorktreeMountPaths[repo.MountPath] = repo.Host
 	}
 
 	return nil

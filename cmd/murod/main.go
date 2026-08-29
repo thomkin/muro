@@ -65,6 +65,8 @@ func run() int {
 	}
 
 	mgr := sandbox.NewManager(store, isolator, proxySrv, publisher)
+	mgr.SetStateDir(stateDir)
+	mgr.SetGitPolicy(cfg.GitPolicy.AllowedSubcommands)
 	if pubsubClient != nil {
 		mgr.EnablePubsub(stateDir, &pubsubAdapter{client: pubsubClient, topicRoot: cfg.MQTT.TopicRoot}, &pubsubAdapter{client: pubsubClient, topicRoot: cfg.MQTT.TopicRoot})
 	}

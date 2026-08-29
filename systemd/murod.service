@@ -3,8 +3,8 @@ Description=muro sandbox daemon
 After=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/murod
+ExecStart=%h/.local/bin/murod
 Restart=on-failure
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

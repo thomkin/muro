@@ -32,8 +32,15 @@ func StateDir() (string, error) {
 }
 
 // ProfilesDir returns the directory holding reusable sandbox profiles:
-// <ConfigDir>/profiles.
+// $MURO_PROFILES_DIR if set, or <ConfigDir>/profiles otherwise (so
+// ~/.config/muro/profiles by default, alongside the rest of muro's config,
+// honoring $XDG_CONFIG_HOME the same way ConfigDir/StateDir do). Each
+// profile is still its own directory (<ProfilesDir>/<name>/profile.json
+// plus optional docs) regardless of where ProfilesDir itself lives.
 func ProfilesDir() (string, error) {
+	if dir := os.Getenv("MURO_PROFILES_DIR"); dir != "" {
+		return dir, nil
+	}
 	cfgDir, err := ConfigDir()
 	if err != nil {
 		return "", err

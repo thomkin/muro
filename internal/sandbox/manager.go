@@ -4,11 +4,14 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/thomkin/muro/internal/config"
 	"github.com/thomkin/muro/internal/state"
+	"github.com/thomkin/muro/internal/worktree"
 )
 
 // ProxyUpdater is the minimal surface Manager needs from the URL-allowlist
@@ -120,6 +123,7 @@ func (m *Manager) Reattach(sb *state.Sandbox) error {
 	// the previous murod's died along with that process, even though the
 	// sandbox (and its bwrap-side mount at the same host path) survived.
 	m.startAgentBridge(sb)
+	m.startToolBridge(sb)
 	h, err := ra.Reattach(sb.PID, sb.ShimSocket, sb.SlirpPID, sb.NetAddr)
 	if err != nil {
 		return fmt.Errorf("reattach sandbox %s/%s: %w", sb.Namespace, sb.Name, err)
@@ -215,6 +219,23 @@ type Manager struct {
 	agentSockets    map[string]*agentSocketServer // key: sandboxID (state.Sandbox.ID)
 	inboxSubscribed map[string]bool               // key: mapKey(namespace, name)
 
+	// toolSockets holds the git tool-proxy's per-sandbox listeners
+	// (toolsocket.go) — unlike agentSockets, there is no "enabled" gate at
+	// the Manager level: a listener is started per-sandbox purely based on
+	// whether that sandbox's own GitPolicy has any repos configured
+	// (startToolBridge), since (unlike pub/sub) there's no broker
+	// connection this depends on.
+	toolMu                      sync.Mutex
+	toolSockets                 map[string]*toolSocketServer // key: sandboxID
+	daemonGitAllowedSubcommands []string
+	// stateDir is murod's XDG state directory — used to compute
+	// ToolSocketPath (independent of pubStateDir/EnablePubsub, since the
+	// git tool-proxy has nothing to do with pub/sub and must not silently
+	// stop working just because MQTT isn't configured) and, more generally
+	// now, anywhere a sandbox needs its own private on-disk area (private
+	// directories, PrivateDirMounts). Set via SetStateDir.
+	stateDir string
+
 	maxRestartAttempts int
 	backoffFunc        func(attempt int) time.Duration
 	sleep              func(time.Duration)
@@ -224,18 +245,25 @@ type Manager struct {
 // tests that don't care about those side effects.
 func NewManager(store *state.Store, iso Isolator, proxy ProxyUpdater, publisher EventPublisher) *Manager {
 	return &Manager{
-		handles:            make(map[string]Handle),
-		epoch:              make(map[string]int),
-		store:              store,
-		isolator:           iso,
-		proxy:              proxy,
-		publisher:          publisher,
-		attachReg:          newAttachRegistry(),
-		agentSockets:       make(map[string]*agentSocketServer),
-		inboxSubscribed:    make(map[string]bool),
-		maxRestartAttempts: DefaultMaxRestartAttempts,
-		backoffFunc:        backoffDelay,
-		sleep:              time.Sleep,
+		handles:         make(map[string]Handle),
+		epoch:           make(map[string]int),
+		store:           store,
+		isolator:        iso,
+		proxy:           proxy,
+		publisher:       publisher,
+		attachReg:       newAttachRegistry(),
+		agentSockets:    make(map[string]*agentSocketServer),
+		inboxSubscribed: make(map[string]bool),
+		toolSockets:     make(map[string]*toolSocketServer),
+		// Defaulted here (not left nil) so tests that exercise a git
+		// policy without ever calling SetGitPolicy still behave like
+		// cmd/murod would with an unconfigured daemon.yaml — mirrors
+		// config.DefaultDaemonConfig's own default exactly, via that same
+		// function, so the two can't drift apart.
+		daemonGitAllowedSubcommands: config.DefaultDaemonConfig().GitPolicy.AllowedSubcommands,
+		maxRestartAttempts:          DefaultMaxRestartAttempts,
+		backoffFunc:                 backoffDelay,
+		sleep:                       time.Sleep,
 	}
 }
 
@@ -325,6 +353,75 @@ func (m *Manager) stopAgentBridge(sandboxID string) {
 	}
 }
 
+// SetGitPolicy configures the daemon-global ceiling for the git tool-proxy
+// (DaemonConfig.GitPolicy.AllowedSubcommands, config.go). cmd/murod is the
+// only real caller; tests that don't use the git tool-proxy never need to
+// call this — NewManager already seeds a sensible built-in default.
+func (m *Manager) SetGitPolicy(daemonAllowedSubcommands []string) {
+	m.toolMu.Lock()
+	defer m.toolMu.Unlock()
+	m.daemonGitAllowedSubcommands = daemonAllowedSubcommands
+}
+
+// SetStateDir records murod's XDG state directory for computing
+// ToolSocketPath (bwrap.go) — deliberately independent of EnablePubsub's
+// stateDir parameter, even though in practice cmd/murod passes the same
+// directory to both: the git tool-proxy has nothing to do with pub/sub and
+// must keep working whether or not an MQTT broker is configured.
+// cmd/murod is the only real caller; a sandbox with no git policy never
+// needs this to have been called.
+func (m *Manager) SetStateDir(stateDir string) {
+	m.toolMu.Lock()
+	defer m.toolMu.Unlock()
+	m.stateDir = stateDir
+}
+
+// startToolBridge brings up sb's git tool-proxy listener (toolsocket.go),
+// idempotent per sb.ID — a no-op if sb.GitPolicy has no repos configured,
+// matching bwrap.go's "absence of policy means the stub isn't even
+// mounted" convention: no listener, nothing to dial, nothing to shadow.
+// Called from Run (before Launch — same "listener up before the mount
+// could possibly be dialed" reasoning as startAgentBridge) and from
+// Reattach (this process's own listener for sb doesn't exist yet).
+func (m *Manager) startToolBridge(sb *state.Sandbox) {
+	if len(sb.GitPolicy.Repos) == 0 {
+		return
+	}
+	m.toolMu.Lock()
+	defer m.toolMu.Unlock()
+	if _, ok := m.toolSockets[sb.ID]; ok {
+		return
+	}
+	path := ToolSocketPath(m.stateDir, sb.ID)
+	if srv, err := startToolSocket(path, sb.Mounts, sb.GitPolicy, m.daemonGitAllowedSubcommands); err == nil {
+		m.toolSockets[sb.ID] = srv
+	}
+	// A listen failure here is not escalated to a launch failure, matching
+	// this codebase's established tolerance for a partially-degraded
+	// optional subsystem — but note Launch will still fail separately if
+	// spec.ToolSocketPath ends up empty-but-expected is never the case
+	// here: buildLaunchSpec sets ToolSocketPath from the same len(Repos)>0
+	// condition regardless of whether the listener actually started, so a
+	// listen failure here means the sandbox launches with a mounted socket
+	// nothing is serving — a clear "connection refused" from the stub
+	// rather than a silent hang.
+}
+
+// stopToolBridge tears down sandboxID's tool-socket listener (Stop's final
+// teardown path only — Restart/watchLoop's crash-relaunch reuse the same
+// sandboxID and therefore the same ToolSocketPath, so the existing
+// listener keeps serving the freshly-Launched sandbox's new mount
+// unchanged and must NOT be stopped there — identical reasoning to
+// stopAgentBridge).
+func (m *Manager) stopToolBridge(sandboxID string) {
+	m.toolMu.Lock()
+	defer m.toolMu.Unlock()
+	if srv, ok := m.toolSockets[sandboxID]; ok {
+		srv.stop()
+		delete(m.toolSockets, sandboxID)
+	}
+}
+
 func mapKey(namespace, name string) string { return namespace + "/" + name }
 
 func effectiveRestartPolicy(p string) string {
@@ -332,6 +429,105 @@ func effectiveRestartPolicy(p string) string {
 		return "never"
 	}
 	return p
+}
+
+// resolvedProfileFields is everything a state.Sandbox needs derived from a
+// config.Profile — shared by Run (a brand-new sandbox) and
+// Restart(fromProfile=true) (an existing one picking up a profile edit),
+// so the two can never drift on how a profile turns into a running
+// sandbox's config.
+type resolvedProfileFields struct {
+	AgentArgs     []string
+	Env           map[string]string
+	Mounts        []config.Mount
+	Tools         []config.Tool
+	AllowURLs     []string
+	RestartPolicy string
+	GitPolicy     config.GitPolicy
+	Audio         bool
+	PrivateDirs   []string
+	Worktrees     []state.WorktreeInfo
+}
+
+// resolveSandboxFieldsFromProfile resolves profile's mounts (including
+// audio-passthrough sockets, if enabled) and copies its other
+// sandbox-relevant fields. Audio failing to resolve fails this outright
+// rather than silently degrading — unlike pub/sub (a nice-to-have bridge),
+// the entire reason a profile sets Audio is "I need this to actually
+// work," so finding out now beats an STT tool silently getting nothing.
+func resolveSandboxFieldsFromProfile(profile *config.Profile, namespace, name, stateDir, sandboxID string) (resolvedProfileFields, error) {
+	mounts, err := ResolveMounts(profile)
+	if err != nil {
+		return resolvedProfileFields{}, err
+	}
+	bundleMounts, berr := BundleDocsMounts(profile.Name)
+	if berr != nil {
+		return resolvedProfileFields{}, fmt.Errorf("resolve bundle docs for sandbox %s/%s: %w", namespace, name, berr)
+	}
+	mounts = append(mounts, bundleMounts...)
+	if profile.Audio {
+		audioMounts, aerr := AudioMounts(os.Getenv("XDG_RUNTIME_DIR"))
+		if aerr != nil {
+			return resolvedProfileFields{}, fmt.Errorf("resolve audio passthrough for sandbox %s/%s: %w", namespace, name, aerr)
+		}
+		mounts = append(mounts, audioMounts...)
+	}
+	if len(profile.PrivateDirs) > 0 {
+		expandedPrivateDirs := make([]string, len(profile.PrivateDirs))
+		for i, pd := range profile.PrivateDirs {
+			expandedPrivateDirs[i] = config.ExpandHome(pd)
+		}
+		privateMounts, perr := PrivateDirMounts(stateDir, sandboxID, expandedPrivateDirs)
+		if perr != nil {
+			return resolvedProfileFields{}, fmt.Errorf("resolve private dirs for sandbox %s/%s: %w", namespace, name, perr)
+		}
+		mounts = append(mounts, privateMounts...)
+	}
+	if profile.Instructions != "" || len(profile.Skills) > 0 {
+		hostHome, herr := os.UserHomeDir()
+		if herr != nil {
+			return resolvedProfileFields{}, fmt.Errorf("resolve instructions/skills for sandbox %s/%s: determine host home dir: %w", namespace, name, herr)
+		}
+		if instrMount, ierr := InstructionsMount(hostHome, config.ExpandHome(profile.Instructions)); ierr != nil {
+			return resolvedProfileFields{}, fmt.Errorf("resolve instructions for sandbox %s/%s: %w", namespace, name, ierr)
+		} else if instrMount != nil {
+			mounts = append(mounts, *instrMount)
+		}
+		expandedSkills := make([]string, len(profile.Skills))
+		for i, sk := range profile.Skills {
+			expandedSkills[i] = config.ExpandHome(sk)
+		}
+		skillMounts, serr := SkillMounts(hostHome, expandedSkills)
+		if serr != nil {
+			return resolvedProfileFields{}, fmt.Errorf("resolve skills for sandbox %s/%s: %w", namespace, name, serr)
+		}
+		mounts = append(mounts, skillMounts...)
+	}
+	gitPolicy := cloneGitPolicy(profile.Git)
+	worktreeMounts, effectiveWorktreeRepos, worktrees, werr := WorktreeMounts(
+		context.Background(), stateDir, sandboxID, namespace, name, profile.Git.Repos)
+	if werr != nil {
+		return resolvedProfileFields{}, fmt.Errorf("resolve worktrees for sandbox %s/%s: %w", namespace, name, werr)
+	}
+	mounts = append(mounts, worktreeMounts...)
+	gitPolicy.Repos = append(gitPolicy.Repos, effectiveWorktreeRepos...)
+
+	envCopy := make(map[string]string, len(profile.Env))
+	for k, v := range profile.Env {
+		envCopy[k] = v
+	}
+	return resolvedProfileFields{
+		AgentArgs:     append([]string(nil), profile.AgentArgs...),
+		Env:           envCopy,
+		Mounts:        mounts,
+		Tools:         profile.Tools,
+		AllowURLs:     append([]string(nil), profile.AllowURLs...),
+		RestartPolicy: effectiveRestartPolicy(profile.RestartPolicy),
+		GitPolicy:     gitPolicy,
+		Audio:         profile.Audio,
+		PrivateDirs:   append([]string(nil), profile.PrivateDirs...),
+		Worktrees:     worktrees,
+	}, nil
 }
 
 // isActive reports whether a sandbox in state s counts as "already
@@ -346,8 +542,16 @@ func isActive(s state.SandboxState) bool {
 	}
 }
 
-func (m *Manager) buildLaunchSpec(sb *state.Sandbox, env map[string]string) LaunchSpec {
-	cmd := []string{sb.Agent}
+func (m *Manager) buildLaunchSpec(sb *state.Sandbox) LaunchSpec {
+	agentArgs := make([]string, len(sb.AgentArgs))
+	for i, a := range sb.AgentArgs {
+		// SessionIDTemplateToken substitution: agent_args are exec'd
+		// directly with no shell in between, so a literal "$MURO_SESSION_ID"
+		// reference would never expand — this is the one place that
+		// actually happens.
+		agentArgs[i] = strings.ReplaceAll(a, SessionIDTemplateToken, sb.SessionID)
+	}
+	cmd := append([]string{sb.Agent}, agentArgs...)
 	if sb.Agent == "" {
 		cmd = []string{"/bin/sh"} // fallback; real agent command construction is a later (bwrap/cmd) concern
 	}
@@ -360,7 +564,7 @@ func (m *Manager) buildLaunchSpec(sb *state.Sandbox, env map[string]string) Laun
 		SandboxID: sb.ID,
 		Mounts:    sb.Mounts,
 		Tools:     sb.Tools,
-		Env:       env,
+		Env:       sb.Env,
 		Cmd:       cmd,
 		PTY:       true,
 		LogPath:   logPath,
@@ -368,6 +572,13 @@ func (m *Manager) buildLaunchSpec(sb *state.Sandbox, env map[string]string) Laun
 	if m.pubsubEnabled() {
 		spec.AgentSocketPath = AgentSocketPath(m.pubStateDir, sb.ID)
 	}
+	if len(sb.GitPolicy.Repos) > 0 {
+		spec.ToolSocketPath = ToolSocketPath(m.stateDir, sb.ID)
+	}
+	if sb.Audio {
+		spec.AudioRuntimeDir = os.Getenv("XDG_RUNTIME_DIR")
+	}
+	spec.SessionID = sb.SessionID
 	return spec
 }
 
@@ -423,12 +634,16 @@ func (m *Manager) Run(profile *config.Profile, name, namespace string) (*state.S
 		return nil, fmt.Errorf("sandbox %s/%s is already active", namespace, name)
 	}
 
-	resolvedMounts, err := ResolveMounts(profile)
+	id, err := state.NewID()
+	if err != nil {
+		return nil, err
+	}
+	sessionID, err := NewSessionID()
 	if err != nil {
 		return nil, err
 	}
 
-	id, err := state.NewID()
+	fields, err := resolveSandboxFieldsFromProfile(profile, namespace, name, m.stateDir, id)
 	if err != nil {
 		return nil, err
 	}
@@ -439,12 +654,19 @@ func (m *Manager) Run(profile *config.Profile, name, namespace string) (*state.S
 		Namespace:     namespace,
 		Profile:       profile.Name,
 		Agent:         profile.Agent,
-		Mounts:        resolvedMounts,
-		Tools:         profile.Tools,
-		AllowURLs:     append([]string(nil), profile.AllowURLs...),
-		RestartPolicy: effectiveRestartPolicy(profile.RestartPolicy),
+		AgentArgs:     fields.AgentArgs,
+		Env:           fields.Env,
+		Mounts:        fields.Mounts,
+		Tools:         fields.Tools,
+		AllowURLs:     fields.AllowURLs,
+		RestartPolicy: fields.RestartPolicy,
 		State:         state.StateRunning,
 		StartedAt:     time.Now(),
+		GitPolicy:     fields.GitPolicy,
+		Audio:         fields.Audio,
+		SessionID:     sessionID,
+		PrivateDirs:   fields.PrivateDirs,
+		Worktrees:     fields.Worktrees,
 	}
 
 	// Started BEFORE Launch, not after: the listener must already be up
@@ -452,10 +674,12 @@ func (m *Manager) Run(profile *config.Profile, name, namespace string) (*state.S
 	// sandboxed process could dial before anything is listening — see
 	// startAgentBridge's own doc comment.
 	m.startAgentBridge(sb)
+	m.startToolBridge(sb)
 
-	handle, err := m.isolator.Launch(context.Background(), m.buildLaunchSpec(sb, profile.Env))
+	handle, err := m.isolator.Launch(context.Background(), m.buildLaunchSpec(sb))
 	if err != nil {
 		m.stopAgentBridge(sb.ID)
+		m.stopToolBridge(sb.ID)
 		return nil, fmt.Errorf("launch sandbox %s/%s: %w", namespace, name, err)
 	}
 	captureHandleInfo(sb, handle)
@@ -617,12 +841,54 @@ func (m *Manager) Reload(namespace, name string) error {
 // force-detaching any existing attach session first (DESIGN.md §12): a
 // restart re-execs the agent behind a brand-new pty, so an existing
 // session is stale the moment restart runs.
-func (m *Manager) Restart(namespace, name string) error {
+func (m *Manager) Restart(namespace, name string, fromProfile bool) error {
 	live, ok := m.store.Get(namespace, name)
 	if !ok {
 		return fmt.Errorf("sandbox %s/%s not found", namespace, name)
 	}
 	sb := *live // copy before mutating — see Reload's comment
+
+	// fromProfile is `muro sandbox restart --from-profile`: the only way to
+	// get an edited profile's changes (mounts, tools, allow_urls, agent,
+	// git policy, audio) into an already-running sandbox without stopping
+	// it and launching a brand-new one under a fresh ID. Without this flag,
+	// restart keeps its original meaning: relaunch with whatever this
+	// sandbox already has stored (its own prior mounts, or whatever `muro
+	// sandbox update` staged), unrelated to the profile file's current
+	// content.
+	if fromProfile {
+		profile, err := config.LoadProfile(sb.Profile)
+		if err != nil {
+			return fmt.Errorf("reload profile %q for restart: %w", sb.Profile, err)
+		}
+		fields, err := resolveSandboxFieldsFromProfile(profile, namespace, name, m.stateDir, sb.ID)
+		if err != nil {
+			return err
+		}
+		sb.Agent = profile.Agent
+		sb.AgentArgs = fields.AgentArgs
+		sb.Env = fields.Env
+		sb.Mounts = fields.Mounts
+		sb.Tools = fields.Tools
+		sb.AllowURLs = fields.AllowURLs
+		sb.RestartPolicy = fields.RestartPolicy
+		sb.GitPolicy = fields.GitPolicy
+		sb.Audio = fields.Audio
+		sb.PrivateDirs = fields.PrivateDirs
+		sb.Worktrees = fields.Worktrees
+		// sb.SessionID is deliberately left untouched here — it's a stable
+		// per-sandbox-INSTANCE identity (same ID = same session), not
+		// something a profile edit should ever change.
+
+		// The tool-socket listener (if any) was started once with the OLD
+		// mounts/GitPolicy captured in its own fields — startToolBridge is
+		// a no-op if one already exists for this sandbox ID, so a stale
+		// listener would otherwise keep enforcing the pre-edit git policy
+		// forever. Tear it down so the startToolBridge call below (after
+		// sb's fields are updated, before Launch — same timing rule Run
+		// already follows) creates a fresh one with the current values.
+		m.stopToolBridge(sb.ID)
+	}
 
 	key := mapKey(namespace, name)
 	m.attachReg.Detach(key)
@@ -634,7 +900,11 @@ func (m *Manager) Restart(namespace, name string) error {
 		}
 	}
 
-	handle, err := m.isolator.Launch(context.Background(), m.buildLaunchSpec(&sb, nil))
+	if fromProfile {
+		m.startToolBridge(&sb)
+	}
+
+	handle, err := m.isolator.Launch(context.Background(), m.buildLaunchSpec(&sb))
 	if err != nil {
 		sb.State = state.StateCrashed
 		_ = m.store.Put(&sb)
@@ -676,6 +946,7 @@ func (m *Manager) Stop(namespace, name string) error {
 	key := mapKey(namespace, name)
 	m.attachReg.Detach(key)
 	m.stopAgentBridge(sb.ID)
+	m.stopToolBridge(sb.ID)
 
 	sb.State = state.StateStopped
 	if err := m.store.Put(&sb); err != nil {
@@ -692,6 +963,144 @@ func (m *Manager) Stop(namespace, name string) error {
 		_ = m.publisher.PublishStatus(namespace, name, "stopped")
 	}
 	return nil
+}
+
+// Delete permanently removes a sandbox's record (state.Store.Delete), its
+// captured log file, and any private directories it owns (PrivateDirs,
+// RemovePrivateDirs) — the confirmation prompt for this is a CLI concern
+// (internal/cli), not enforced here. Refuses a still-active sandbox (must
+// be stopped/crashed/restart-exhausted first, same as the rest of this
+// package's active-state checks) so `delete` never doubles as an implicit
+// stop.
+// Delete permanently removes a stopped sandbox's record, log, and private
+// data. discardWorktrees names the MountPath of every worktree (DESIGN.md
+// §15) whose unmerged commits the caller has explicitly accepted losing
+// (`muro sandbox delete --discard-worktree <mount_path>`) — any worktree
+// NOT listed there that still has commits unmerged into its base branch
+// causes the WHOLE delete to be refused up front (nothing is deleted, the
+// same "refuse outright, don't partially apply" posture the active-sandbox
+// check above already has), since the existing --yes confirmation only
+// covers deleting metadata/logs, never discarding real, unmerged code.
+func (m *Manager) Delete(namespace, name string, discardWorktrees []string) error {
+	sb, ok := m.store.Get(namespace, name)
+	if !ok {
+		return fmt.Errorf("sandbox %s/%s not found", namespace, name)
+	}
+	if isActive(sb.State) {
+		return fmt.Errorf("sandbox %s/%s is still active (state %q) — stop it first", namespace, name, sb.State)
+	}
+
+	discard := make(map[string]bool, len(discardWorktrees))
+	for _, mp := range discardWorktrees {
+		discard[mp] = true
+	}
+	for _, wt := range sb.Worktrees {
+		if discard[wt.MountPath] {
+			continue
+		}
+		has, err := worktree.HasUnmergedCommits(context.Background(), wt.Host, wt.BaseBranch)
+		if err != nil {
+			return fmt.Errorf("sandbox %s/%s: check worktree %q for unmerged commits: %w", namespace, name, wt.MountPath, err)
+		}
+		if has {
+			return fmt.Errorf("sandbox %s/%s has unmerged commits on branch %q (mount %q) — "+
+				"run `muro sandbox merge %s/%s --repo %s` first, or pass --discard-worktree %s to discard them",
+				namespace, name, wt.Branch, wt.MountPath, namespace, name, wt.MountPath, wt.MountPath)
+		}
+	}
+
+	if err := m.store.Delete(namespace, name); err != nil {
+		return err
+	}
+
+	if logPath, err := config.SandboxLogPath(namespace, name); err == nil {
+		_ = os.Remove(logPath) // a missing log (nothing was ever captured) is not an error
+	}
+	if m.stateDir != "" {
+		_ = RemovePrivateDirs(m.stateDir, sb.ID)
+	}
+	// Best-effort, like RemovePrivateDirs above — the sandbox record is
+	// already gone at this point, so a worktree cleanup failure (e.g. the
+	// real repo was moved/deleted out from under it) must not turn a
+	// successful delete into an error; nothing unmerged reaches here, the
+	// guard above already ensured that.
+	for _, wt := range sb.Worktrees {
+		if discard[wt.MountPath] {
+			_ = worktree.Discard(context.Background(), wt.RepoHost, wt.Host, wt.Branch)
+		} else {
+			_ = worktree.Prune(context.Background(), wt.RepoHost, wt.Host, wt.Branch)
+		}
+	}
+	return nil
+}
+
+// Merge squash-merges sandbox namespace/name's git worktree at mountPath
+// (DESIGN.md §15) into its base branch with message as the final commit
+// message, then prunes the worktree and drops it (and its mount) from the
+// sandbox's own record. Works regardless of the sandbox's current state —
+// the merge itself is a host-side git operation on the real repo,
+// independent of whether the sandbox process is running — but if the
+// sandbox IS currently active, its already-launched mount table still
+// includes the now-pruned worktree path, so it's marked StateReloadPending
+// (the same existing mechanism Update already uses for a mount change that
+// can't be hot-applied) rather than silently leaving a live sandbox with a
+// mount pointing at a directory that no longer exists.
+func (m *Manager) Merge(namespace, name, mountPath, message string) (commit string, err error) {
+	sb, ok := m.store.Get(namespace, name)
+	if !ok {
+		return "", fmt.Errorf("sandbox %s/%s not found", namespace, name)
+	}
+
+	idx := -1
+	for i, wt := range sb.Worktrees {
+		if wt.MountPath == mountPath {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		return "", fmt.Errorf("sandbox %s/%s has no worktree at mount_path %q", namespace, name, mountPath)
+	}
+	wt := sb.Worktrees[idx]
+
+	has, err := worktree.HasUnmergedCommits(context.Background(), wt.Host, wt.BaseBranch)
+	if err != nil {
+		return "", fmt.Errorf("check worktree %q for unmerged commits: %w", mountPath, err)
+	}
+	if !has {
+		return "", fmt.Errorf("worktree %q has no commits to merge", mountPath)
+	}
+
+	commit, err = worktree.SquashMerge(context.Background(), wt.RepoHost, wt.Host, wt.Branch, wt.BaseBranch, message)
+	if err != nil {
+		return "", err
+	}
+
+	// The merge itself already succeeded and is not reversible from here —
+	// a prune failure (e.g. the worktree directory was manually tampered
+	// with) must not be reported as the merge having failed, only surfaced
+	// separately.
+	pruneErr := worktree.Prune(context.Background(), wt.RepoHost, wt.Host, wt.Branch)
+
+	sb.Worktrees = append(append([]state.WorktreeInfo(nil), sb.Worktrees[:idx]...), sb.Worktrees[idx+1:]...)
+	newMounts := make([]config.Mount, 0, len(sb.Mounts))
+	for _, mnt := range sb.Mounts {
+		if mnt.Host == wt.Host && mnt.SandboxPath == wt.MountPath {
+			continue
+		}
+		newMounts = append(newMounts, mnt)
+	}
+	sb.Mounts = newMounts
+	if isActive(sb.State) {
+		sb.State = state.StateReloadPending
+	}
+	if putErr := m.store.Put(sb); putErr != nil {
+		return commit, fmt.Errorf("merge succeeded (commit %s) but failed to update sandbox record: %w", commit, putErr)
+	}
+	if pruneErr != nil {
+		return commit, fmt.Errorf("merge succeeded (commit %s) but failed to prune the worktree afterward: %w", commit, pruneErr)
+	}
+	return commit, nil
 }
 
 // Attach claims exclusive interactive access to a running sandbox's pty
@@ -768,7 +1177,7 @@ func (m *Manager) watchLoop(namespace, name string, h Handle, epoch int) {
 
 		m.sleep(m.backoffFunc(sb.RestartCount))
 
-		newHandle, err := m.isolator.Launch(context.Background(), m.buildLaunchSpec(&sb, nil))
+		newHandle, err := m.isolator.Launch(context.Background(), m.buildLaunchSpec(&sb))
 		if err != nil {
 			sb.State = state.StateCrashed
 			crashed := sb
@@ -795,12 +1204,23 @@ func (m *Manager) watchLoop(namespace, name string, h Handle, epoch int) {
 	}
 
 	m.clearHandle(key)
-	if sb.RestartPolicy == "on-failure" && !cleanExit {
+	switch {
+	case sb.RestartPolicy == "on-failure" && !cleanExit:
 		sb.State = state.StateRestartExhausted
 		if m.publisher != nil {
 			_ = m.publisher.PublishStatus(namespace, name, "restart-exhausted")
 		}
-	} else {
+	case cleanExit:
+		// The process exited on its own with code 0 (e.g. the agent/shell
+		// ran `exit`) and restart_policy didn't call for a relaunch — this
+		// is an ordinary stop, not a crash, exactly like `muro sandbox
+		// stop` setting StateStopped, just initiated from inside the
+		// sandbox instead of by the user's own command.
+		sb.State = state.StateStopped
+		if m.publisher != nil {
+			_ = m.publisher.PublishStatus(namespace, name, "stopped")
+		}
+	default:
 		sb.State = state.StateCrashed
 		if m.publisher != nil {
 			_ = m.publisher.PublishStatus(namespace, name, "crashed")

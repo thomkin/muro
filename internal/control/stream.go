@@ -81,7 +81,7 @@ func (s *Server) handleAttach(conn net.Conn, r *bufio.Reader, req Request) {
 			}
 		}
 		if err != nil {
-			return // client disconnected, or a real read error
+			return // client disconnected, or processExited closed conn (cmd/muro-shim), or a real read error
 		}
 	}
 }
@@ -266,6 +266,15 @@ func pumpPtyToConn(pty io.ReadWriteCloser, conn net.Conn, done <-chan struct{}) 
 			if supportsDeadline && os.IsTimeout(err) {
 				continue
 			}
+			// The pty itself ended (the sandboxed process exited) — close
+			// conn so handleAttach's own loop, blocked reading the client's
+			// keystrokes, unblocks and returns too, instead of hanging
+			// forever waiting for input that will never explain why the
+			// session is already over. Safe to close conn from this
+			// goroutine: it's the standard way to interrupt a concurrent
+			// blocking Read on the same net.Conn, and handleAttach's own
+			// cleanup (pty.Close/detach) doesn't touch conn again after.
+			_ = conn.Close()
 			return
 		}
 	}

@@ -22,15 +22,36 @@ type MQTTConfig struct {
 	TopicRoot string `yaml:"topic_root"`
 }
 
+// GitPolicyConfig holds daemon-wide git tool-proxy defaults.
+// AllowedSubcommands is a ceiling: a profile can only ever reach
+// subcommands in this list, regardless of its own git.repos configuration
+// — there is no profile-level way to add a subcommand beyond what the
+// daemon permits. This is the "global rules vs per-container rules" split
+// the design settled on: this struct is the global layer, Profile.Git
+// (profile.go) is the per-container grant within it.
+type GitPolicyConfig struct {
+	AllowedSubcommands []string `yaml:"allowed_subcommands"`
+}
+
+// defaultGitAllowedSubcommands is the built-in ceiling used whenever
+// daemon.yaml omits git_policy.allowed_subcommands entirely — a
+// deliberately minimal, mostly-non-interactive set (internal/gitproxy's
+// per-subcommand argv grammar further restricts each of these; this list
+// only says which subcommands are reachable AT ALL).
+func defaultGitAllowedSubcommands() []string {
+	return []string{"status", "diff", "log", "show", "add", "commit", "push", "fetch", "pull"}
+}
+
 // DaemonConfig is the on-disk shape of ~/.config/muro/daemon.yaml
 // (DESIGN.md §7, IMPLEMENTATION.md §8).
 type DaemonConfig struct {
-	ControlSocketPath string       `yaml:"control_socket_path"`
-	Broker            BrokerConfig `yaml:"broker"`
-	MQTT              MQTTConfig   `yaml:"mqtt"`
-	LogLevel          string       `yaml:"log_level"`
-	EventLogCap       int          `yaml:"event_log_cap"`
-	RestartBackoffCap int          `yaml:"restart_backoff_cap"`
+	ControlSocketPath string          `yaml:"control_socket_path"`
+	Broker            BrokerConfig    `yaml:"broker"`
+	MQTT              MQTTConfig      `yaml:"mqtt"`
+	LogLevel          string          `yaml:"log_level"`
+	EventLogCap       int             `yaml:"event_log_cap"`
+	RestartBackoffCap int             `yaml:"restart_backoff_cap"`
+	GitPolicy         GitPolicyConfig `yaml:"git_policy"`
 }
 
 // DefaultDaemonConfig returns the built-in defaults used when
@@ -51,6 +72,7 @@ func DefaultDaemonConfig() *DaemonConfig {
 		LogLevel:          "info",
 		EventLogCap:       200,
 		RestartBackoffCap: 5,
+		GitPolicy:         GitPolicyConfig{AllowedSubcommands: defaultGitAllowedSubcommands()},
 	}
 }
 
@@ -78,6 +100,9 @@ func LoadDaemonConfig(path string) (*DaemonConfig, error) {
 	}
 	if cfg.MQTT.TopicRoot == "" {
 		cfg.MQTT.TopicRoot = "muro"
+	}
+	if len(cfg.GitPolicy.AllowedSubcommands) == 0 {
+		cfg.GitPolicy.AllowedSubcommands = defaultGitAllowedSubcommands()
 	}
 
 	return cfg, nil

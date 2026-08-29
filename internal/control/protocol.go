@@ -38,6 +38,8 @@ const (
 	TypeSandboxReload  = "sandbox.reload"
 	TypeSandboxRestart = "sandbox.restart"
 	TypeSandboxStop    = "sandbox.stop"
+	TypeSandboxDelete  = "sandbox.delete"
+	TypeSandboxMerge   = "sandbox.merge"
 	TypeSandboxAttach  = "sandbox.attach"
 	TypeLogs           = "logs"
 	TypeBrokerStatus   = "broker.status"
@@ -74,6 +76,9 @@ type SandboxRunRequest struct {
 	Name      string `json:"name"`
 	Namespace string `json:"namespace,omitempty"`
 	Agent     string `json:"agent,omitempty"` // optional override of the profile's agent
+	// AgentArgs, if non-empty, REPLACES the profile's whole agent_args
+	// list (not appended) — the same override semantics as Agent above.
+	AgentArgs []string `json:"agent_args,omitempty"`
 }
 
 // SandboxRunResponse's payload IS a *SandboxView directly, same as
@@ -123,6 +128,12 @@ type SandboxReloadResponse struct {
 type SandboxRestartRequest struct {
 	Namespace string `json:"namespace,omitempty"`
 	Name      string `json:"name"`
+	// FromProfile re-resolves mounts/tools/allow_urls/agent/git-policy/audio
+	// from the sandbox's own recorded profile before relaunching, instead
+	// of reusing whatever the sandbox already has stored — the only way to
+	// get an edited profile file's changes into an already-running sandbox
+	// without stopping it and launching a brand-new one under a fresh ID.
+	FromProfile bool `json:"from_profile,omitempty"`
 }
 
 type SandboxRestartResponse struct {
@@ -138,6 +149,49 @@ type SandboxStopRequest struct {
 
 type SandboxStopResponse struct {
 	OK bool `json:"ok"`
+}
+
+// --- sandbox.delete ---
+
+// SandboxDeleteRequest has no confirmation field — the CLI is where the
+// interactive yes/no (or --yes) confirmation belongs, since the daemon has
+// no notion of a terminal to prompt on. By the time this request reaches
+// murod, confirmation has already happened.
+type SandboxDeleteRequest struct {
+	Namespace string `json:"namespace,omitempty"`
+	Name      string `json:"name"`
+	// DiscardWorktrees names the mount_path of every git worktree
+	// (DESIGN.md §15) whose unmerged commits the caller has explicitly
+	// accepted losing (`muro sandbox delete --discard-worktree
+	// <mount_path>`). A worktree with unmerged commits NOT listed here
+	// causes the whole delete to be refused — deliberately separate from
+	// the CLI's own --yes flag, which only confirms deleting metadata/logs,
+	// never discarding real code.
+	DiscardWorktrees []string `json:"discard_worktrees,omitempty"`
+}
+
+type SandboxDeleteResponse struct {
+	OK bool `json:"ok"`
+}
+
+// --- sandbox.merge ---
+
+// SandboxMergeRequest asks murod to squash-merge one of a sandbox's git
+// worktrees (DESIGN.md §15) into its base branch. Message is the final
+// commit message — already reviewed/edited by the operator client-side
+// (muro sandbox merge's own $EDITOR step, mirroring `profile edit`) before
+// this request is ever sent; murod performs no interactive confirmation of
+// its own.
+type SandboxMergeRequest struct {
+	Namespace string `json:"namespace,omitempty"`
+	Name      string `json:"name"`
+	MountPath string `json:"mount_path"`
+	Message   string `json:"message"`
+}
+
+type SandboxMergeResponse struct {
+	OK     bool   `json:"ok"`
+	Commit string `json:"commit"`
 }
 
 // --- sandbox.attach ---
@@ -210,18 +264,36 @@ type ToolView struct {
 	As   string `json:"as"`
 }
 
+// WorktreeView mirrors internal/state.WorktreeInfo, plus a live
+// HasUnmergedCommits check (DESIGN.md §15) — one `git rev-list --count` per
+// worktree, cheap enough to always include rather than gating behind a
+// separate opt-in on a single-operator-machine tool.
+type WorktreeView struct {
+	MountPath string `json:"mount_path"`
+	// Host is the worktree's own real path on the host — safe to expose
+	// (this is a local, single-operator-machine control API; the operator
+	// already has full filesystem access to their own machine) and needed
+	// by `muro sandbox merge` to run its local, read-only diff/log preview
+	// without a second round-trip.
+	Host               string `json:"host"`
+	Branch             string `json:"branch"`
+	BaseBranch         string `json:"base_branch"`
+	HasUnmergedCommits bool   `json:"has_unmerged_commits"`
+}
+
 type SandboxView struct {
-	ID            string      `json:"id"`
-	Name          string      `json:"name"`
-	Namespace     string      `json:"namespace"`
-	Profile       string      `json:"profile"`
-	Agent         string      `json:"agent"`
-	PID           int         `json:"pid"`
-	State         string      `json:"state"`
-	StartedAt     string      `json:"started_at"` // RFC3339
-	Mounts        []MountView `json:"mounts"`
-	Tools         []ToolView  `json:"tools"`
-	AllowURLs     []string    `json:"allow_urls"`
-	RestartPolicy string      `json:"restart_policy"`
-	RestartCount  int         `json:"restart_count"`
+	ID            string         `json:"id"`
+	Name          string         `json:"name"`
+	Namespace     string         `json:"namespace"`
+	Profile       string         `json:"profile"`
+	Agent         string         `json:"agent"`
+	PID           int            `json:"pid"`
+	State         string         `json:"state"`
+	StartedAt     string         `json:"started_at"` // RFC3339
+	Mounts        []MountView    `json:"mounts"`
+	Tools         []ToolView     `json:"tools"`
+	AllowURLs     []string       `json:"allow_urls"`
+	RestartPolicy string         `json:"restart_policy"`
+	RestartCount  int            `json:"restart_count"`
+	Worktrees     []WorktreeView `json:"worktrees,omitempty"`
 }

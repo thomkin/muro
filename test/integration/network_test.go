@@ -33,10 +33,26 @@ import (
 // sandboxed shell script writes its result into a file on a read-write
 // mount, and the test reads that file back from the host side afterward.
 
-func waitForProxyUp(t *testing.T) {
+// waitForProxyUp waits for testProxyAddr to accept connections, but also
+// watches errCh for an early ListenAndServe failure (most likely: the port
+// is already taken by something else — a real murod running on this dev
+// machine, or a leftover process from a previous run) and fails loudly and
+// specifically instead of just timing out with a generic message. A
+// silently-swallowed bind error here used to make a test's sandboxed script
+// unknowingly talk to whatever else was already listening on the port,
+// producing a confusing, misleading test failure instead of a clear one —
+// confirmed as the actual root cause of exactly that failure during this
+// project's own development, hence testProxyAddr being deliberately
+// distinct from production's fixed port now too (see its doc comment).
+func waitForProxyUp(t *testing.T, errCh <-chan error) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
+		select {
+		case err := <-errCh:
+			t.Fatalf("test proxy failed to start on %s: %v", testProxyAddr, err)
+		default:
+		}
 		conn, err := net.DialTimeout("tcp", testProxyAddr, 100*time.Millisecond)
 		if err == nil {
 			conn.Close()
@@ -62,8 +78,9 @@ func startTestProxy(t *testing.T, allowURLs []string) {
 	srv.SandboxKeyFunc = func(string) (string, bool) { return key, true }
 	srv.SetAllowlist(key, allowURLs)
 
-	go func() { _ = srv.ListenAndServe(testProxyAddr) }()
-	waitForProxyUp(t)
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe(testProxyAddr) }()
+	waitForProxyUp(t, errCh)
 }
 
 func newUpstreamStub(t *testing.T, body string) *httptest.Server {
@@ -104,11 +121,19 @@ func fetchViaProxyScript(targetURL, outFile string) []string {
 	// (bwrap.go's buildArgs), confirmed empirically to be the address that
 	// actually reaches the host's real proxy listener through the
 	// slirp4netns bridge; 127.0.0.1 never leaves the sandbox's own private
-	// loopback interface at all.
+	// loopback interface at all. The port MUST come from testProxyAddr, not
+	// be hardcoded to production's 18080 — this bit the test suite directly
+	// during this project's own development, once testProxyAddr was changed
+	// to a distinct port to stop colliding with a real running murod: the
+	// port here silently stayed pinned to the old value.
+	_, port, err := net.SplitHostPort(testProxyAddr)
+	if err != nil {
+		panic("testProxyAddr must be a valid host:port: " + err.Error())
+	}
 	return []string{"/bin/sh", "-c", fmt.Sprintf(
 		`sleep 0.3
-timeout 2 sh -c 'exec 3<>/dev/tcp/10.0.2.2/18080 && printf "GET %s HTTP/1.0\r\nHost: proxy\r\n\r\n" >&3 && cat <&3 > %s' || echo CONNECT_FAILED > %s`,
-		targetURL, outFile, outFile,
+timeout 2 sh -c 'exec 3<>/dev/tcp/10.0.2.2/%s && printf "GET %s HTTP/1.0\r\nHost: proxy\r\n\r\n" >&3 && cat <&3 > %s' || echo CONNECT_FAILED > %s`,
+		port, targetURL, outFile, outFile,
 	)}
 }
 

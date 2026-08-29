@@ -33,6 +33,50 @@ func testSandbox(namespace, name string) *Sandbox {
 	}
 }
 
+// TestStoreList_SortedByNamespaceThenName is the regression test for a
+// real bug: List built its result by ranging over the internal map
+// directly, and Go's map iteration order is deliberately randomized — so
+// two calls in a row could (and did, confirmed by direct reproduction
+// against `muro tui`, which polls List roughly every 1.5s) return the
+// same sandboxes in a different order, making a live list visibly
+// reshuffle on every poll.
+func TestStoreList_SortedByNamespaceThenName(t *testing.T) {
+	store := NewStore(filepath.Join(t.TempDir(), "state.json"))
+	// Insertion order deliberately not already sorted.
+	for _, sb := range []*Sandbox{
+		testSandbox("default", "zebra"),
+		testSandbox("beta", "agent"),
+		testSandbox("default", "alpha"),
+		testSandbox("alpha", "agent"),
+	} {
+		if err := store.Put(sb); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for range 5 {
+		got := store.List("")
+		if len(got) != 4 {
+			t.Fatalf("List() returned %d sandboxes, want 4", len(got))
+		}
+		want := []string{"alpha/agent", "beta/agent", "default/alpha", "default/zebra"}
+		for i, sb := range got {
+			key := sb.Namespace + "/" + sb.Name
+			if key != want[i] {
+				t.Fatalf("List()[%d] = %q, want %q (full order: %v)", i, key, want[i], listKeys(got))
+			}
+		}
+	}
+}
+
+func listKeys(sbs []*Sandbox) []string {
+	keys := make([]string, len(sbs))
+	for i, sb := range sbs {
+		keys[i] = sb.Namespace + "/" + sb.Name
+	}
+	return keys
+}
+
 func TestStorePutGetListDelete(t *testing.T) {
 	dir := t.TempDir()
 	s := NewStore(filepath.Join(dir, "state.json"))

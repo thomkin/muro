@@ -17,8 +17,15 @@ import (
 // kernel-level isolation (that's covered separately by
 // test/integration against the real BwrapIsolator).
 type fakeIsolator struct {
-	mu   sync.Mutex
-	next int
+	mu      sync.Mutex
+	next    int
+	handles []*fakeHandle // every handle ever launched, for tests that need to reach back in (e.g. simulating the agent side of a pty closing)
+}
+
+func (f *fakeIsolator) lastHandle() *fakeHandle {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.handles[len(f.handles)-1]
 }
 
 type fakeHandle struct {
@@ -59,7 +66,14 @@ func (f *fakeIsolator) Launch(_ context.Context, spec sandbox.LaunchSpec) (sandb
 	f.next++
 	pid := 10000 + f.next
 	f.mu.Unlock()
-	return newFakeHandle(pid, spec.PTY)
+	h, err := newFakeHandle(pid, spec.PTY)
+	if err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	f.handles = append(f.handles, h)
+	f.mu.Unlock()
+	return h, nil
 }
 
 func (f *fakeIsolator) UpdateMounts(_ sandbox.Handle, mounts []config.Mount) (bool, error) {

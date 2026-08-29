@@ -46,6 +46,30 @@ func AgentSocketPath(stateDir, sandboxID string) string {
 	return filepath.Join(stateDir, "sandboxes", sandboxID, "agent.sock")
 }
 
+// ToolSocketMountPath is the fixed, sandbox-internal path every sandbox
+// with a non-empty git policy gets its tool-proxy socket mounted at — same
+// "fixed, not profile-controlled" convention as AgentSocketMountPath.
+const ToolSocketMountPath = "/run/muro/tool.sock"
+
+// GitStubMountPath is where the git tool-proxy stub (cmd/muro-toolstub) is
+// mounted when a sandbox has a non-empty git policy — toolRoot
+// ("/usr/local/bin", mounts.go) + "/git", the same fixed PATH location a
+// profile's own tools:/mounts: entries would use for a real git binary.
+// This mount is added AFTER the profile's own mounts in buildArgs
+// specifically so it wins any collision: a real git binary must never be
+// reachable from inside a sandbox that has a git policy configured — that
+// is the entire point of the tool-proxy.
+const GitStubMountPath = toolRoot + "/git"
+
+// ToolSocketPath returns the host-side path murod listens on for
+// sandboxID's tool-proxy socket — same pure-function-of-stateDir+sandboxID
+// pattern as AgentSocketPath, for the same reason (both Manager, which
+// starts the listener, and BwrapIsolator, which mounts it, independently
+// compute the identical path).
+func ToolSocketPath(stateDir, sandboxID string) string {
+	return filepath.Join(stateDir, "sandboxes", sandboxID, "tool.sock")
+}
+
 // BwrapIsolator is the v1 Isolator implementation: it execs the bwrap
 // (bubblewrap) binary rather than driving Linux namespace syscalls
 // directly (DESIGN.md §6.1). Filesystem access is deny-by-default — a
@@ -131,6 +155,21 @@ func checkUnprivilegedUserns(bwrapPath string) error {
 	}
 }
 
+// toolstubPath resolves cmd/muro-toolstub's location on PATH — looked up
+// lazily here (from Launch), not at NewBwrapIsolator construction time
+// alongside muro-shim/slirp4netns/nsenter/nft, since most sandboxes have no
+// git policy configured at all and shouldn't be blocked from launching by
+// a binary they don't need; only a sandbox whose profile actually
+// configures a git policy pays for this lookup, and only that sandbox's
+// launch fails if it's missing.
+func (b *BwrapIsolator) toolstubPath() (string, error) {
+	path, err := exec.LookPath("muro-toolstub")
+	if err != nil {
+		return "", fmt.Errorf("muro-toolstub not found on PATH but this sandbox's profile configures a git policy — it ships alongside muro/murod/muro-shim and must be installed the same way: %w", err)
+	}
+	return path, nil
+}
+
 // buildArgs turns a LaunchSpec into bwrap's argv. It's a pure function
 // deliberately kept separate from Launch so it can be unit-tested without
 // actually running bwrap.
@@ -196,6 +235,31 @@ func (b *BwrapIsolator) buildArgs(spec LaunchSpec) []string {
 			Mode:        "rw",
 		})
 	}
+	if spec.ToolSocketPath != "" {
+		// The git tool-proxy's transport (internal/sandbox/toolsocket.go):
+		// murod already listens on spec.ToolSocketPath on the host side
+		// (started by Manager before Launch, same "listener up before the
+		// mount could possibly be dialed" reasoning as the agent socket
+		// above) — this mount is what makes it reachable from inside the
+		// sandbox.
+		mounts = append(append([]config.Mount(nil), mounts...), config.Mount{
+			Host:        spec.ToolSocketPath,
+			SandboxPath: ToolSocketMountPath,
+			Mode:        "rw",
+		})
+	}
+	if spec.GitStubHostPath != "" {
+		// Appended LAST, after the profile's own mounts and the sockets
+		// above, so it wins any collision at GitStubMountPath — a real git
+		// binary reachable alongside the stub would defeat the entire
+		// point of the tool-proxy. Read-only: the stub itself never needs
+		// to be written to from inside the sandbox.
+		mounts = append(append([]config.Mount(nil), mounts...), config.Mount{
+			Host:        spec.GitStubHostPath,
+			SandboxPath: GitStubMountPath,
+			Mode:        "ro",
+		})
+	}
 	for _, m := range mounts {
 		if m.Mode == "rw" {
 			args = append(args, "--bind", m.Host, m.SandboxPath)
@@ -224,6 +288,18 @@ func (b *BwrapIsolator) buildArgs(spec LaunchSpec) []string {
 		"HTTPS_PROXY": proxyURL,
 		"http_proxy":  proxyURL,
 		"https_proxy": proxyURL,
+	}
+	if spec.AudioRuntimeDir != "" {
+		// Points PipeWire's/PulseAudio's client libraries at the same
+		// $XDG_RUNTIME_DIR the sockets were bind-mounted at (audio.go) —
+		// both default to $XDG_RUNTIME_DIR/pipewire-0 and
+		// $XDG_RUNTIME_DIR/pulse/native respectively, so matching paths is
+		// the whole trick; no other env var is needed for either client to
+		// find its socket.
+		env["XDG_RUNTIME_DIR"] = spec.AudioRuntimeDir
+	}
+	if spec.SessionID != "" {
+		env[SessionIDEnvVar] = spec.SessionID
 	}
 	for k, v := range spec.Env {
 		env[k] = v
@@ -262,6 +338,13 @@ func (b *BwrapIsolator) buildArgs(spec LaunchSpec) []string {
 // --unshare-net gives the sandbox a fresh, unconfigured network namespace
 // (not even a usable loopback) with no bridge back to anything.
 func (b *BwrapIsolator) Launch(ctx context.Context, spec LaunchSpec) (Handle, error) {
+	if spec.ToolSocketPath != "" {
+		stubPath, err := b.toolstubPath()
+		if err != nil {
+			return nil, err
+		}
+		spec.GitStubHostPath = stubPath
+	}
 	args := b.buildArgs(spec)
 
 	sandboxID := spec.SandboxID

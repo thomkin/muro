@@ -9,11 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/spf13/cobra"
 
-	"github.com/thomkin/muro/internal/config"
 	"github.com/thomkin/muro/internal/control"
 )
 
@@ -75,22 +73,10 @@ func Execute() int {
 	return ExitGeneralError
 }
 
-// controlSocketPath resolves the same path DefaultDaemonConfig/murod uses:
-// daemon.yaml's control_socket_path if the file exists and sets one,
-// otherwise the default (~/.local/state/muro/control.sock).
-func controlSocketPath() string {
-	if cfgDir, err := config.ConfigDir(); err == nil {
-		if cfg, err := config.LoadDaemonConfig(filepath.Join(cfgDir, "daemon.yaml")); err == nil && cfg.ControlSocketPath != "" {
-			return cfg.ControlSocketPath
-		}
-	}
-	return config.DefaultDaemonConfig().ControlSocketPath
-}
-
 // dialControl connects to murod's control socket, or returns a socketErr
 // (exit code 3) if it's unreachable.
 func dialControl() (*control.Client, error) {
-	c, err := control.Dial(controlSocketPath())
+	c, err := control.Dial(control.ResolveSocketPath())
 	if err != nil {
 		return nil, socketErr(err)
 	}

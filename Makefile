@@ -1,4 +1,4 @@
-BINARIES := muro murod muro-broker muro-shim
+BINARIES := muro murod muro-broker muro-shim muro-toolstub
 
 .PHONY: build test test-integration lint clean install
 
@@ -15,7 +15,7 @@ test-integration: build
 	@command -v bwrap >/dev/null || { echo "bwrap not found, skipping"; exit 0; }
 	@command -v slirp4netns >/dev/null || { echo "slirp4netns not found, skipping"; exit 0; }
 	@command -v nft >/dev/null || { echo "nft not found, skipping"; exit 0; }
-	PATH="$(CURDIR)/bin:$$PATH" go test -tags=integration ./test/integration/...
+	PATH="$(CURDIR)/bin:$$PATH" go test -tags=integration ./...
 
 lint:
 	gofmt -l .
@@ -26,4 +26,4 @@ clean:
 	rm -rf bin/
 
 install: build
-	sudo scripts/install.sh
+	scripts/install.sh

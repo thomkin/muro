@@ -2,6 +2,7 @@ package control
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"github.com/thomkin/muro/internal/config"
 	"github.com/thomkin/muro/internal/sandbox"
 	"github.com/thomkin/muro/internal/state"
+	"github.com/thomkin/muro/internal/worktree"
 )
 
 // BrokerStatusChecker is the minimal surface Server needs from the pub/sub
@@ -274,6 +276,10 @@ func (s *Server) dispatch(req Request) Response {
 		return s.handleSandboxRestart(req.Payload)
 	case TypeSandboxStop:
 		return s.handleSandboxStop(req.Payload)
+	case TypeSandboxDelete:
+		return s.handleSandboxDelete(req.Payload)
+	case TypeSandboxMerge:
+		return s.handleSandboxMerge(req.Payload)
 	case TypeBrokerStatus:
 		return s.handleBrokerStatus()
 	case TypeDaemonShutdown:
@@ -369,6 +375,9 @@ func (s *Server) handleSandboxRun(payload json.RawMessage) Response {
 	if req.Agent != "" {
 		profile.Agent = req.Agent
 	}
+	if len(req.AgentArgs) > 0 {
+		profile.AgentArgs = req.AgentArgs
+	}
 
 	sb, err := s.mgr.Run(profile, req.Name, req.Namespace)
 	if err != nil {
@@ -450,7 +459,7 @@ func (s *Server) handleSandboxRestart(payload json.RawMessage) Response {
 	if err := validateNamespaceName(req.Namespace, req.Name); err != nil {
 		return errResp(err)
 	}
-	if err := s.mgr.Restart(defaultNS(req.Namespace), req.Name); err != nil {
+	if err := s.mgr.Restart(defaultNS(req.Namespace), req.Name, req.FromProfile); err != nil {
 		return errResp(err)
 	}
 	return okResp(SandboxRestartResponse{OK: true})
@@ -468,6 +477,38 @@ func (s *Server) handleSandboxStop(payload json.RawMessage) Response {
 		return errResp(err)
 	}
 	return okResp(SandboxStopResponse{OK: true})
+}
+
+func (s *Server) handleSandboxDelete(payload json.RawMessage) Response {
+	var req SandboxDeleteRequest
+	if err := json.Unmarshal(payload, &req); err != nil {
+		return errResp(fmt.Errorf("bad sandbox.delete payload: %w", err))
+	}
+	if err := validateNamespaceName(req.Namespace, req.Name); err != nil {
+		return errResp(err)
+	}
+	if err := s.mgr.Delete(defaultNS(req.Namespace), req.Name, req.DiscardWorktrees); err != nil {
+		return errResp(err)
+	}
+	return okResp(SandboxDeleteResponse{OK: true})
+}
+
+func (s *Server) handleSandboxMerge(payload json.RawMessage) Response {
+	var req SandboxMergeRequest
+	if err := json.Unmarshal(payload, &req); err != nil {
+		return errResp(fmt.Errorf("bad sandbox.merge payload: %w", err))
+	}
+	if err := validateNamespaceName(req.Namespace, req.Name); err != nil {
+		return errResp(err)
+	}
+	if req.MountPath == "" {
+		return errResp(fmt.Errorf("sandbox.merge: mount_path is required"))
+	}
+	commit, err := s.mgr.Merge(defaultNS(req.Namespace), req.Name, req.MountPath, req.Message)
+	if err != nil {
+		return errResp(err)
+	}
+	return okResp(SandboxMergeResponse{OK: true, Commit: commit})
 }
 
 func (s *Server) handleBrokerStatus() Response {
@@ -491,6 +532,17 @@ func toView(sb *state.Sandbox) *SandboxView {
 	for _, t := range sb.Tools {
 		tools = append(tools, ToolView{Host: t.Host, As: t.As})
 	}
+	var worktrees []WorktreeView
+	for _, wt := range sb.Worktrees {
+		has, _ := worktree.HasUnmergedCommits(context.Background(), wt.Host, wt.BaseBranch) // best-effort: a check failure just shows as false, doesn't hide the sandbox
+		worktrees = append(worktrees, WorktreeView{
+			MountPath:          wt.MountPath,
+			Host:               wt.Host,
+			Branch:             wt.Branch,
+			BaseBranch:         wt.BaseBranch,
+			HasUnmergedCommits: has,
+		})
+	}
 	return &SandboxView{
 		ID:            sb.ID,
 		Name:          sb.Name,
@@ -505,5 +557,6 @@ func toView(sb *state.Sandbox) *SandboxView {
 		AllowURLs:     sb.AllowURLs,
 		RestartPolicy: sb.RestartPolicy,
 		RestartCount:  sb.RestartCount,
+		Worktrees:     worktrees,
 	}
 }

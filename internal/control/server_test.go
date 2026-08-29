@@ -21,7 +21,8 @@ import (
 func newTestServer(t *testing.T) (srv *Server, socketPath string) {
 	t.Helper()
 	dir := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", dir) // config.LoadProfile reads profiles from here
+	t.Setenv("XDG_CONFIG_HOME", dir)   // legacy; profiles now also isolated via MURO_PROFILES_DIR below
+	t.Setenv("MURO_PROFILES_DIR", dir) // config.LoadProfile reads profiles from here
 
 	store := state.NewStore(filepath.Join(dir, "state.json"))
 	if err := store.Load(); err != nil {
@@ -314,6 +315,7 @@ func TestHandleConn_OversizedLineDisconnects(t *testing.T) {
 func TestHandleConn_IdleClientDisconnected(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", dir)
+	t.Setenv("MURO_PROFILES_DIR", dir)
 
 	store := state.NewStore(filepath.Join(dir, "state.json"))
 	if err := store.Load(); err != nil {
@@ -341,6 +343,85 @@ func TestHandleConn_IdleClientDisconnected(t *testing.T) {
 	_, err = conn.Read(buf)
 	if err == nil {
 		t.Fatal("expected the idle connection to be closed by the server, got a successful read")
+	}
+}
+
+// TestAttach_UnblocksWhenSandboxExits closes a real bug: handleAttach ran
+// two independent loops — one forwarding client keystrokes to the pty, one
+// (pumpPtyToConn) forwarding pty output to the client — and only the first
+// controlled when the connection actually closed. When the sandboxed
+// process exited (the pty ending), pumpPtyToConn noticed and returned, but
+// the other loop stayed blocked waiting for the client to type something or
+// disconnect, with nothing to tell it the session was already over — attach
+// would hang forever instead of ending when `exit` was typed inside the
+// sandbox.
+func TestAttach_UnblocksWhenSandboxExits(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	t.Setenv("MURO_PROFILES_DIR", dir)
+	store := state.NewStore(filepath.Join(dir, "state.json"))
+	if err := store.Load(); err != nil {
+		t.Fatalf("store.Load: %v", err)
+	}
+	iso := &fakeIsolator{}
+	mgr := sandbox.NewManager(store, iso, nil, nil)
+	srv := NewServer(mgr, store, nil)
+	socketPath := filepath.Join(dir, "control.sock")
+	go func() {
+		if err := srv.ListenAndServe(socketPath); err != nil {
+			t.Logf("ListenAndServe: %v", err)
+		}
+	}()
+	t.Cleanup(func() { _ = srv.Close() })
+	waitForSocket(t, socketPath)
+	saveTestProfile(t, "test-profile")
+
+	setup, err := Dial(socketPath)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	var ran SandboxView
+	if err := setup.Call(TypeSandboxRun, SandboxRunRequest{Profile: "test-profile", Name: "agent-1", Namespace: "default"}, &ran); err != nil {
+		t.Fatalf("sandbox.run: %v", err)
+	}
+	setup.Close()
+
+	c1, err := Dial(socketPath)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c1.Close()
+	r1, _, err := c1.Attach("default", "agent-1")
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	// Simulate the sandboxed process exiting: close the fake pty's "agent
+	// side", which is exactly what a real muro-shim's pty ending looks
+	// like from handleAttach's point of view — pty.Read starts returning
+	// EOF/an error.
+	if err := iso.lastHandle().peer.Close(); err != nil {
+		t.Fatalf("close fake pty peer: %v", err)
+	}
+
+	// Before the fix, this Read would hang until the test's own timeout
+	// (or forever, outside a test) since nothing ever unblocked
+	// handleAttach's client-input loop. After the fix, the server closes
+	// the connection once it notices the pty ended, so this returns
+	// (EOF or a closed-connection error) promptly.
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 16)
+		_, err := r1.Read(buf)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatalf("expected Read to return an error/EOF once the sandbox exited, got nil")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("attach did not unblock within 3s of the sandboxed process exiting — the hang bug is back")
 	}
 }
 

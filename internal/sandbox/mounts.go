@@ -30,10 +30,25 @@ func ResolveMounts(p *config.Profile) ([]config.Mount, error) {
 		case "":
 			continue
 		case "*":
-			out = append(out, config.Mount{Host: t.Host, SandboxPath: toolRoot, Mode: "ro"})
+			out = append(out, config.Mount{Host: config.ExpandHome(t.Host), SandboxPath: toolRoot, Mode: "ro"})
 		default:
-			out = append(out, config.Mount{Host: t.Host, SandboxPath: toolRoot + "/" + t.As, Mode: "ro"})
+			out = append(out, config.Mount{Host: config.ExpandHome(t.Host), SandboxPath: toolRoot + "/" + t.As, Mode: "ro"})
 		}
+	}
+	// Expand "~" in every mount's Host AND SandboxPath — the mechanism
+	// that makes a profile authored on one machine ("~/.claude/...")
+	// resolve correctly on a different one. Validation above already
+	// expands "~" internally for its own dangerous-root comparisons, but
+	// (deliberately, per its own doc comment) never mutates p.Mounts
+	// itself — this is the actual point that turns a literal "~" into a
+	// real path before it ever reaches bwrap, which has no shell to do
+	// that expansion for it. SandboxPath gets the same treatment as Host:
+	// this project's own convention is that a sandbox's $HOME always
+	// matches the real host user's, so "~/.claude/settings.json" as a
+	// sandbox_path means the same real path on either side.
+	for i := range out {
+		out[i].Host = config.ExpandHome(out[i].Host)
+		out[i].SandboxPath = config.ExpandHome(out[i].SandboxPath)
 	}
 	return out, nil
 }
@@ -45,6 +60,36 @@ func mergeMounts(existing, add []config.Mount) []config.Mount {
 	out := append([]config.Mount(nil), existing...)
 	out = append(out, add...)
 	return out
+}
+
+// cloneGitPolicy deep-copies p's non-worktree repos so a state.Sandbox built
+// from a profile at Run time shares no slice memory with the caller's own
+// *config.Profile — the same "resolve once, don't alias" precaution
+// ResolveMounts and Run's own AllowURLs copy already apply. Worktree: true
+// repos are deliberately excluded here — those go through
+// WorktreeMounts (worktree.go) instead, which builds their EFFECTIVE
+// policy entry (Host rewritten to the generated worktree's own path,
+// AllowedBranches replaced with the sandbox's own generated branch, per
+// DESIGN.md §15) rather than a straight clone of the profile-declared
+// values.
+func cloneGitPolicy(p config.GitPolicy) config.GitPolicy {
+	var repos []config.GitRepoPolicy
+	for _, repo := range p.Repos {
+		if repo.Worktree {
+			continue
+		}
+		// "~" expansion (config.ExpandHome), same as every other host path
+		// in a profile — a git policy repo authored as "~/projects/foo" on
+		// one machine must resolve on whichever machine actually launches
+		// this sandbox, not stay a literal, meaningless "~" once it
+		// reaches internal/gitproxy's own host-path matching.
+		repos = append(repos, config.GitRepoPolicy{
+			Host:            config.ExpandHome(repo.Host),
+			AllowedBranches: append([]string(nil), repo.AllowedBranches...),
+			AllowedRemotes:  append([]string(nil), repo.AllowedRemotes...),
+		})
+	}
+	return config.GitPolicy{Repos: repos}
 }
 
 // applyURLDelta returns existing with remove entries dropped and add
