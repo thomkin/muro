@@ -16,6 +16,12 @@ type LaunchSpec struct {
 	Cmd    []string
 	PTY    bool
 
+	// WorkDir is the sandbox-internal path the launched process's cwd is
+	// set to (bwrap's --chdir). Empty means "/" — every sandbox's behavior
+	// before this field existed, preserved as the default so an unset
+	// profile field changes nothing.
+	WorkDir string
+
 	// SandboxID identifies which sandbox this is launching (state.Sandbox's
 	// ID, set by Manager before calling Launch). BwrapIsolator uses it to
 	// name the surviving shim process's per-sandbox socket/status-file

@@ -8,6 +8,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/thomkin/muro/internal/control"
 )
@@ -29,6 +30,12 @@ func key(s string) tea.KeyMsg {
 		return tea.KeyMsg(tea.Key{Type: tea.KeyTab})
 	case "ctrl+c":
 		return tea.KeyMsg(tea.Key{Type: tea.KeyCtrlC})
+	case "left":
+		return tea.KeyMsg(tea.Key{Type: tea.KeyLeft})
+	case "right":
+		return tea.KeyMsg(tea.Key{Type: tea.KeyRight})
+	case "ctrl+left":
+		return tea.KeyMsg(tea.Key{Type: tea.KeyCtrlLeft})
 	default:
 		return tea.KeyMsg(tea.Key{Type: tea.KeyRunes, Runes: []rune(s)})
 	}
@@ -42,6 +49,26 @@ func update(t *testing.T, m Model, msg tea.Msg) Model {
 		t.Fatalf("Update returned a %T, want Model", next)
 	}
 	return got
+}
+
+func TestRunningListDelegate_ItemStylesCarryTheBackgroundTint(t *testing.T) {
+	d := runningListDelegate()
+	styles := []struct {
+		name  string
+		style lipgloss.Style
+	}{
+		{"NormalTitle", d.Styles.NormalTitle},
+		{"NormalDesc", d.Styles.NormalDesc},
+		{"SelectedTitle", d.Styles.SelectedTitle},
+		{"SelectedDesc", d.Styles.SelectedDesc},
+		{"DimmedTitle", d.Styles.DimmedTitle},
+		{"DimmedDesc", d.Styles.DimmedDesc},
+	}
+	for _, s := range styles {
+		if s.style.GetBackground() != runningListBackground {
+			t.Errorf("%s background = %v, want %v (the tint that visually separates the Running list from the console pane)", s.name, s.style.GetBackground(), runningListBackground)
+		}
+	}
 }
 
 func TestModel_InitialTabIsRunning(t *testing.T) {
@@ -256,6 +283,99 @@ func TestModel_EnterOnRunningSandboxAttemptsAttach(t *testing.T) {
 	}
 }
 
+func TestModel_RunningListScopedToActiveNamespace(t *testing.T) {
+	m := NewModel()
+	m = update(t, m, statusMsg{sandboxes: []*control.SandboxView{
+		{Namespace: "duo", Name: "frank1"},
+		{Namespace: "default", Name: "agent-1"},
+	}})
+	// "default" sorts before "duo", so the very first population should
+	// default to showing "default"'s sandboxes only.
+	if m.activeNamespace != "default" {
+		t.Fatalf("activeNamespace = %q, want default", m.activeNamespace)
+	}
+	items := m.running.Items()
+	if len(items) != 1 {
+		t.Fatalf("running list has %d items, want 1 (only \"default\"'s sandbox)", len(items))
+	}
+	sb, ok := items[0].(sandboxItem)
+	if !ok || sb.view.Name != "agent-1" {
+		t.Errorf("items[0] = %+v, want sandboxItem for agent-1", items[0])
+	}
+}
+
+func TestModel_CycleNamespaceKeySwitchesActiveNamespaceAndScopedList(t *testing.T) {
+	m := NewModel()
+	m = update(t, m, statusMsg{sandboxes: []*control.SandboxView{
+		{Namespace: "duo", Name: "frank1", State: "running"},
+		{Namespace: "default", Name: "agent-1", State: "running"},
+	}})
+
+	m = update(t, m, key("right"))
+	if m.activeNamespace != "duo" {
+		t.Fatalf("activeNamespace after right = %q, want duo", m.activeNamespace)
+	}
+	items := m.running.Items()
+	if len(items) != 1 {
+		t.Fatalf("running list has %d items, want 1 (only \"duo\"'s sandbox)", len(items))
+	}
+	if sb, ok := items[0].(sandboxItem); !ok || sb.view.Name != "frank1" {
+		t.Errorf("items[0] = %+v, want sandboxItem for frank1", items[0])
+	}
+
+	m = update(t, m, key("left"))
+	if m.activeNamespace != "default" {
+		t.Errorf("activeNamespace after right then left = %q, want default (back where it started)", m.activeNamespace)
+	}
+}
+
+func TestModel_CycleNamespaceWrapsAround(t *testing.T) {
+	m := NewModel()
+	m = update(t, m, statusMsg{sandboxes: []*control.SandboxView{
+		{Namespace: "duo", Name: "frank1"},
+		{Namespace: "default", Name: "agent-1"},
+	}})
+	// Starts on "default" (first alphabetically); "left" (previous) from the
+	// first namespace must wrap around to the last one, not do nothing.
+	m = update(t, m, key("left"))
+	if m.activeNamespace != "duo" {
+		t.Errorf("activeNamespace after left from the first namespace = %q, want duo (wrapped to the last)", m.activeNamespace)
+	}
+}
+
+func TestModel_CycleNamespaceNoopWithOnlyOneNamespace(t *testing.T) {
+	m := NewModel()
+	m = update(t, m, statusMsg{sandboxes: []*control.SandboxView{
+		{Namespace: "default", Name: "agent-1"},
+	}})
+	m = update(t, m, key("right"))
+	if m.activeNamespace != "default" {
+		t.Errorf("activeNamespace = %q, want unchanged \"default\" with only one namespace known", m.activeNamespace)
+	}
+}
+
+func TestModel_ActiveNamespaceFallsBackWhenItsLastSandboxDisappears(t *testing.T) {
+	m := NewModel()
+	m = update(t, m, statusMsg{sandboxes: []*control.SandboxView{
+		{Namespace: "duo", Name: "frank1"},
+		{Namespace: "default", Name: "agent-1"},
+	}})
+	m = update(t, m, key("right")) // switch to "duo"
+	if m.activeNamespace != "duo" {
+		t.Fatalf("activeNamespace = %q, want duo before the fallback scenario", m.activeNamespace)
+	}
+
+	// "duo" no longer has any sandboxes at all (deleted, or its last one
+	// stopped and expired) — the next poll shouldn't leave activeNamespace
+	// pointing at a namespace with nothing in it.
+	m = update(t, m, statusMsg{sandboxes: []*control.SandboxView{
+		{Namespace: "default", Name: "agent-1"},
+	}})
+	if m.activeNamespace != "default" {
+		t.Errorf("activeNamespace after its namespace vanished = %q, want fallback to default", m.activeNamespace)
+	}
+}
+
 func TestModel_StopKeyIssuesStopCmdForSelectedRunningItem(t *testing.T) {
 	m := NewModel()
 	m = update(t, m, statusMsg{sandboxes: []*control.SandboxView{
@@ -271,6 +391,71 @@ func TestModel_StopKeyIssuesStopCmdForSelectedRunningItem(t *testing.T) {
 	// failure) rather than nil or some other Cmd.
 	if _, ok := cmd().(stoppedMsg); !ok {
 		t.Errorf("Cmd() produced %T, want stoppedMsg", cmd())
+	}
+}
+
+func TestModel_DeleteKeyOpensConfirmScreenWithoutDeletingYet(t *testing.T) {
+	m := NewModel()
+	m = update(t, m, statusMsg{sandboxes: []*control.SandboxView{
+		{Namespace: "default", Name: "agent-1"},
+	}})
+	m = update(t, m, key("d"))
+	if m.screen != screenConfirmDelete {
+		t.Fatalf("screen = %v, want screenConfirmDelete after pressing d", m.screen)
+	}
+	if m.deleteNamespace != "default" || m.deleteName != "agent-1" {
+		t.Errorf("pending delete target = %q/%q, want default/agent-1", m.deleteNamespace, m.deleteName)
+	}
+}
+
+func TestModel_ConfirmDeleteYIssuesDeleteCmdAndReturnsToList(t *testing.T) {
+	m := NewModel()
+	m = update(t, m, statusMsg{sandboxes: []*control.SandboxView{
+		{Namespace: "default", Name: "agent-1"},
+	}})
+	m = update(t, m, key("d"))
+
+	next, cmd := m.Update(key("y"))
+	m = next.(Model)
+	if m.screen != screenList {
+		t.Errorf("screen = %v, want screenList after confirming delete", m.screen)
+	}
+	if m.deleteNamespace != "" || m.deleteName != "" {
+		t.Errorf("pending delete target = %q/%q, want cleared after confirming", m.deleteNamespace, m.deleteName)
+	}
+	if cmd == nil {
+		t.Fatal("expected a non-nil Cmd for the confirmed delete")
+	}
+	if _, ok := cmd().(deletedMsg); !ok {
+		t.Errorf("Cmd() produced %T, want deletedMsg", cmd())
+	}
+}
+
+func TestModel_ConfirmDeleteAnyOtherKeyCancelsWithoutDeleting(t *testing.T) {
+	m := NewModel()
+	m = update(t, m, statusMsg{sandboxes: []*control.SandboxView{
+		{Namespace: "default", Name: "agent-1"},
+	}})
+	m = update(t, m, key("d"))
+
+	next, cmd := m.Update(key("n"))
+	m = next.(Model)
+	if m.screen != screenList {
+		t.Errorf("screen = %v, want screenList after canceling delete", m.screen)
+	}
+	if m.deleteNamespace != "" || m.deleteName != "" {
+		t.Errorf("pending delete target = %q/%q, want cleared after canceling", m.deleteNamespace, m.deleteName)
+	}
+	if cmd != nil {
+		t.Errorf("expected a nil Cmd when canceling delete (no request should be sent), got %v", cmd())
+	}
+}
+
+func TestModel_DeletedMsgErrorSetsErr(t *testing.T) {
+	m := NewModel()
+	m = update(t, m, deletedMsg{err: errBoom})
+	if m.err == nil {
+		t.Error("expected err to be set after a failed delete")
 	}
 }
 
@@ -415,6 +600,26 @@ func TestModel_F2ReturnsFocusToListWithoutClosingSession(t *testing.T) {
 	}
 	if !got.sess.Live() {
 		t.Error("expected the session to remain live after F2")
+	}
+}
+
+func TestModel_CtrlLeftReturnsFocusToListWithoutClosingSession(t *testing.T) {
+	m := NewModel()
+	m.focus = focusConsole
+	sess := &session{namespace: "default", name: "agent-1", done: make(chan struct{})}
+	m.sess = sess
+	m.sessTarget = "default/agent-1"
+
+	next, _ := m.Update(key("ctrl+left"))
+	got := next.(Model)
+	if got.focus != focusListPane {
+		t.Errorf("focus = %v, want focusListPane", got.focus)
+	}
+	if got.sess != sess {
+		t.Error("Ctrl-Left must not close/replace the session, only release keyboard focus")
+	}
+	if !got.sess.Live() {
+		t.Error("expected the session to remain live after Ctrl-Left")
 	}
 }
 

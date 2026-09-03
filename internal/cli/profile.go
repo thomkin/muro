@@ -13,7 +13,7 @@ import (
 
 func init() {
 	profileMountCmd.AddCommand(profileMountAddCmd, profileMountRemoveCmd)
-	profileCmd.AddCommand(profileCreateCmd, profileEditCmd, profileListCmd, profileShowCmd, profileMountCmd, profileAgentArgsCmd, profileInstructionsCmd, profileSkillsCmd)
+	profileCmd.AddCommand(profileCreateCmd, profileEditCmd, profileListCmd, profileShowCmd, profileMountCmd, profileAgentArgsCmd, profileInstructionsCmd, profileSkillsCmd, profileWorkDirCmd, profileAudioCmd, profileQuietModeCmd)
 	rootCmd.AddCommand(profileCmd)
 }
 
@@ -32,6 +32,7 @@ var (
 	profileExtendsFlag      string
 	profileInstructionsFlag string
 	profileSkillFlags       []string
+	profileWorkDirFlag      string
 )
 
 var profileCreateCmd = &cobra.Command{
@@ -65,6 +66,7 @@ var profileCreateCmd = &cobra.Command{
 			Audio:        profileAudioFlag,
 			Instructions: profileInstructionsFlag,
 			Skills:       profileSkillFlags,
+			WorkDir:      profileWorkDirFlag,
 		}
 		if err := config.ValidateProfile(p); err != nil {
 			return usageErr("%v", err)
@@ -89,6 +91,7 @@ func init() {
 	profileCreateCmd.Flags().BoolVar(&profileAudioFlag, "audio", false, "grant this sandbox access to the host's PipeWire/PulseAudio socket (opt-in, off by default)")
 	profileCreateCmd.Flags().StringVar(&profileInstructionsFlag, "instructions", "", "path to a markdown file mounted at ~/.claude/CLAUDE.md inside the sandbox — read by Claude Code at the start of every session, regardless of which directory this sandbox is pointed at")
 	profileCreateCmd.Flags().StringArrayVar(&profileSkillFlags, "skill", nil, "path to a SKILL.md file or a skill directory, repeatable — mounted under ~/.claude/skills/ (Claude Code's Agent Skills mechanism)")
+	profileCreateCmd.Flags().StringVar(&profileWorkDirFlag, "workdir", "", "sandbox-internal path the agent process starts in (default \"/\") — set this to a mounts: entry's sandbox_path (e.g. /workspace) so agent instructions written as project-relative paths resolve correctly")
 }
 
 var profileAgentArgsCmd = &cobra.Command{
@@ -159,6 +162,117 @@ var profileInstructionsSetCmd = &cobra.Command{
 func init() {
 	profileInstructionsSetCmd.Flags().StringVar(&profileInstructionsSetFlag, "file", "", "path to a markdown file (omit or pass \"\" to clear)")
 	profileInstructionsCmd.AddCommand(profileInstructionsSetCmd)
+}
+
+var profileWorkDirCmd = &cobra.Command{
+	Use:   "workdir",
+	Short: "Manage the sandbox-internal working directory an existing profile's agent process starts in",
+}
+
+var profileWorkDirSetFlag string
+
+var profileWorkDirSetCmd = &cobra.Command{
+	Use:   "set <name>",
+	Short: "Set (or clear, with --path \"\") the working directory for a profile",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		p, err := config.LoadProfileRaw(args[0])
+		if err != nil {
+			return err
+		}
+		p.WorkDir = profileWorkDirSetFlag
+		if err := config.ValidateProfile(p); err != nil {
+			return usageErr("%v", err)
+		}
+		if err := config.SaveProfile(p); err != nil {
+			return err
+		}
+		if p.WorkDir == "" {
+			fmt.Printf("cleared workdir on profile %q — the agent process will start in \"/\"\n", p.Name)
+		} else {
+			fmt.Printf("set workdir on profile %q to %q — takes effect on the next `muro run` from it, or an already-running sandbox via `muro sandbox restart --from-profile`\n", p.Name, p.WorkDir)
+		}
+		return nil
+	},
+}
+
+func init() {
+	profileWorkDirSetCmd.Flags().StringVar(&profileWorkDirSetFlag, "path", "", "sandbox-internal path the agent process starts in (omit or pass \"\" to clear, resetting to \"/\")")
+	profileWorkDirCmd.AddCommand(profileWorkDirSetCmd)
+}
+
+var profileAudioCmd = &cobra.Command{
+	Use:   "audio",
+	Short: "Manage whether an existing profile grants access to the host's PipeWire/PulseAudio socket",
+}
+
+var profileAudioSetEnableFlag bool
+
+var profileAudioSetCmd = &cobra.Command{
+	Use:   "set <name>",
+	Short: "Enable (or disable, the default if --enable is omitted) audio passthrough for a profile",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		p, err := config.LoadProfileRaw(args[0])
+		if err != nil {
+			return err
+		}
+		p.Audio = profileAudioSetEnableFlag
+		if err := config.ValidateProfile(p); err != nil {
+			return usageErr("%v", err)
+		}
+		if err := config.SaveProfile(p); err != nil {
+			return err
+		}
+		if p.Audio {
+			fmt.Printf("enabled audio passthrough on profile %q — takes effect on the next `muro run` from it, or an already-running sandbox via `muro sandbox restart --from-profile`\n", p.Name)
+		} else {
+			fmt.Printf("disabled audio passthrough on profile %q\n", p.Name)
+		}
+		return nil
+	},
+}
+
+func init() {
+	profileAudioSetCmd.Flags().BoolVar(&profileAudioSetEnableFlag, "enable", false, "grant this profile access to the host's PipeWire/PulseAudio socket (omit to disable)")
+	profileAudioCmd.AddCommand(profileAudioSetCmd)
+}
+
+var profileQuietModeCmd = &cobra.Command{
+	Use:   "quiet-mode",
+	Short: "Manage whether an existing profile hides tool-call/file-edit noise, showing only Claude Code's reply text",
+}
+
+var profileQuietModeSetEnableFlag bool
+
+var profileQuietModeSetCmd = &cobra.Command{
+	Use:   "set <name>",
+	Short: "Enable (or disable, the default if --enable is omitted) quiet mode for a profile",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		p, err := config.LoadProfileRaw(args[0])
+		if err != nil {
+			return err
+		}
+		p.QuietMode = profileQuietModeSetEnableFlag
+		if err := config.ValidateProfile(p); err != nil {
+			return usageErr("%v", err)
+		}
+		if err := config.SaveProfile(p); err != nil {
+			return err
+		}
+		if p.QuietMode {
+			fmt.Printf("enabled quiet mode on profile %q — takes effect on the next `muro run` from it, or an already-running sandbox via `muro sandbox restart --from-profile`\n", p.Name)
+		} else {
+			fmt.Printf("disabled quiet mode on profile %q\n", p.Name)
+		}
+		return nil
+	},
+	Args: cobra.ExactArgs(1),
+}
+
+func init() {
+	profileQuietModeSetCmd.Flags().BoolVar(&profileQuietModeSetEnableFlag, "enable", false, "hide tool-call/file-edit noise, showing only Claude Code's reply text (omit to disable)")
+	profileQuietModeCmd.AddCommand(profileQuietModeSetCmd)
 }
 
 var profileSkillsCmd = &cobra.Command{

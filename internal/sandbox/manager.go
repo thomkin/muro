@@ -447,6 +447,8 @@ type resolvedProfileFields struct {
 	Audio         bool
 	PrivateDirs   []string
 	Worktrees     []state.WorktreeInfo
+	WorkDir       string
+	QuietMode     bool
 }
 
 // resolveSandboxFieldsFromProfile resolves profile's mounts (including
@@ -527,6 +529,8 @@ func resolveSandboxFieldsFromProfile(profile *config.Profile, namespace, name, s
 		Audio:         profile.Audio,
 		PrivateDirs:   append([]string(nil), profile.PrivateDirs...),
 		Worktrees:     worktrees,
+		WorkDir:       profile.WorkDir,
+		QuietMode:     profile.QuietMode,
 	}, nil
 }
 
@@ -542,6 +546,13 @@ func isActive(s state.SandboxState) bool {
 	}
 }
 
+// quietChatSandboxPath is where cmd/muro-quiet-chat is expected to be
+// installed on the host (scripts/install.sh, alongside the real `claude`
+// binary) — a "~"-prefixed path expanded the same way every other
+// ~/.claude*/~/.local mount already is (config.ExpandHome), so it resolves
+// to the identical path inside the sandbox once ~/.local is mounted.
+const quietChatSandboxPath = "~/.local/bin/muro-quiet-chat"
+
 func (m *Manager) buildLaunchSpec(sb *state.Sandbox) LaunchSpec {
 	agentArgs := make([]string, len(sb.AgentArgs))
 	for i, a := range sb.AgentArgs {
@@ -554,6 +565,16 @@ func (m *Manager) buildLaunchSpec(sb *state.Sandbox) LaunchSpec {
 	cmd := append([]string{sb.Agent}, agentArgs...)
 	if sb.Agent == "" {
 		cmd = []string{"/bin/sh"} // fallback; real agent command construction is a later (bwrap/cmd) concern
+	}
+	if sb.QuietMode {
+		// QuietMode replaces the configured Agent/AgentArgs entirely — the
+		// wrapper always drives Claude Code itself via print mode (see
+		// cmd/muro-quiet-chat and config.Profile.QuietMode's doc comment).
+		// It's installed alongside the real `claude` binary under
+		// ~/.local/bin, which every claude-base-derived profile already
+		// mounts read-only at the identical sandbox path, so no separate
+		// mount is needed here.
+		cmd = []string{config.ExpandHome(quietChatSandboxPath)}
 	}
 	// LogPath failing to compute (only possible if os.UserHomeDir() fails,
 	// e.g. $HOME unset with no XDG override) is not worth failing the
@@ -568,6 +589,7 @@ func (m *Manager) buildLaunchSpec(sb *state.Sandbox) LaunchSpec {
 		Cmd:       cmd,
 		PTY:       true,
 		LogPath:   logPath,
+		WorkDir:   sb.WorkDir,
 	}
 	if m.pubsubEnabled() {
 		spec.AgentSocketPath = AgentSocketPath(m.pubStateDir, sb.ID)
@@ -667,6 +689,8 @@ func (m *Manager) Run(profile *config.Profile, name, namespace string) (*state.S
 		SessionID:     sessionID,
 		PrivateDirs:   fields.PrivateDirs,
 		Worktrees:     fields.Worktrees,
+		WorkDir:       fields.WorkDir,
+		QuietMode:     fields.QuietMode,
 	}
 
 	// Started BEFORE Launch, not after: the listener must already be up
@@ -876,6 +900,8 @@ func (m *Manager) Restart(namespace, name string, fromProfile bool) error {
 		sb.Audio = fields.Audio
 		sb.PrivateDirs = fields.PrivateDirs
 		sb.Worktrees = fields.Worktrees
+		sb.WorkDir = fields.WorkDir
+		sb.QuietMode = fields.QuietMode
 		// sb.SessionID is deliberately left untouched here — it's a stable
 		// per-sandbox-INSTANCE identity (same ID = same session), not
 		// something a profile edit should ever change.
@@ -918,9 +944,27 @@ func (m *Manager) Restart(namespace, name string, fromProfile bool) error {
 	}
 
 	// A restart gets a brand-new bwrap process, hence a brand-new Stage 2
-	// network bridge and outbound address — re-register it even though the
-	// allowlist rule itself (keyed by the stable sb.ID, not the address)
-	// doesn't need re-setting.
+	// network bridge and outbound address — re-register it. The allowlist
+	// rule is keyed by the stable sb.ID, not the address, so it doesn't
+	// need updating for the address change itself — but it DOES need
+	// re-setting regardless, because this call is the only thing that
+	// (re)populates it in THIS murod process's in-memory proxy state. If
+	// murod itself restarted since this sandbox was last (Re)launched,
+	// ReattachAll's own SetAllowlist call is what would normally have
+	// restored it — but that only runs for sandboxes state.Reconcile found
+	// still StateRunning at that exact moment; anything that raced past
+	// that check (or whose Reattach itself failed, logged but not fatal)
+	// starts this murod process with an empty allowlist entry for that ID,
+	// and every one of its requests gets silently denied by the
+	// fail-closed proxy from then on — confirmed as a real, reproduced bug
+	// (`journalctl --user -u murod`, repeated "proxy: denied ... host=api.
+	// anthropic.com" entries for a profile whose allow_urls plainly
+	// includes it) rather than a hypothetical. Setting it here unconditionally
+	// is idempotent and cheap, and closes that gap for good instead of
+	// relying on ReattachAll always having won the race.
+	if m.proxy != nil {
+		m.proxy.SetAllowlist(sb.ID, sb.AllowURLs)
+	}
 	registerHandleNetworkAddr(m.proxy, sb.ID, handle)
 
 	epoch := m.setHandle(key, handle)

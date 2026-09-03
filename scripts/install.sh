@@ -15,7 +15,7 @@ unit_dir="$HOME/.config/systemd/user"
 
 mkdir -p "$bin_dir" "$unit_dir"
 
-install -m 0755 bin/muro bin/murod bin/muro-broker bin/muro-shim bin/muro-toolstub "$bin_dir/"
+install -m 0755 bin/muro bin/murod bin/muro-broker bin/muro-shim bin/muro-toolstub bin/muro-quiet-chat "$bin_dir/"
 install -m 0644 systemd/murod.service systemd/muro-broker.service "$unit_dir/"
 systemctl --user daemon-reload
 

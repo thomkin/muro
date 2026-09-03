@@ -88,6 +88,31 @@ type Profile struct {
 	// own Agent Skills mechanism (.claude/skills/<name>/SKILL.md),
 	// available from any project this sandbox is pointed at.
 	Skills []string `json:"skills,omitempty"`
+	// WorkDir is the sandbox-internal path the agent process starts in
+	// (bwrap's --chdir, internal/sandbox/bwrap.go) — every sandbox used to
+	// get "/" unconditionally, regardless of where a profile's own mounts:
+	// entry puts the actual project (typically /workspace). That silently
+	// broke any agent instructions written as paths relative to the
+	// project root (e.g. a CLAUDE.md/AGENT.md saying "read progress/foo.json"),
+	// since the agent's cwd was never actually inside the project. Empty
+	// means "/", preserving every existing profile's behavior exactly.
+	WorkDir string `json:"workdir,omitempty"`
+	// QuietMode, when true, launches cmd/muro-quiet-chat instead of the
+	// agent directly (internal/sandbox's buildLaunchSpec) — a small wrapper
+	// that drives Claude Code's own non-interactive print mode
+	// (`claude -p ... --output-format json`) turn by turn instead of its
+	// normal interactive UI, so an attached session shows only the
+	// assistant's reply text, never tool_use/tool_result/diff noise. Meant
+	// for a conversational, user-facing profile (a tutor, an assistant)
+	// where watching every file edit/tool call is unhelpful clutter rather
+	// than useful transparency — a coding-focused profile should leave this
+	// off. Agent/AgentArgs are ignored when this is set: the wrapper always
+	// invokes Claude Code itself. Off by default, and — like Audio — OR'd
+	// across an extends chain: once a base profile turns it on, a child
+	// cannot turn it back off (same known, accepted limitation as Audio,
+	// for the same reason: no way to distinguish "child didn't mention it"
+	// from "child explicitly wants it off" without a bigger schema change).
+	QuietMode bool `json:"quiet_mode,omitempty"`
 }
 
 // ProfileBundleDir returns the directory holding one profile's whole
@@ -224,6 +249,8 @@ func mergeProfiles(base, child *Profile) *Profile {
 		PrivateDirs:   append(append([]string(nil), base.PrivateDirs...), child.PrivateDirs...),
 		Instructions:  firstNonEmpty(child.Instructions, base.Instructions),
 		Skills:        append(append([]string(nil), base.Skills...), child.Skills...),
+		WorkDir:       firstNonEmpty(child.WorkDir, base.WorkDir),
+		QuietMode:     base.QuietMode || child.QuietMode,
 	}
 	if len(child.AgentArgs) == 0 {
 		merged.AgentArgs = base.AgentArgs

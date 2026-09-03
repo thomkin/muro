@@ -1,4 +1,4 @@
-BINARIES := muro murod muro-broker muro-shim muro-toolstub
+BINARIES := muro murod muro-broker muro-shim muro-toolstub muro-quiet-chat
 
 .PHONY: build test test-integration lint clean install
 

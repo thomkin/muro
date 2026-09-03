@@ -95,6 +95,32 @@ func stopCmd(namespace, name string) tea.Cmd {
 	}
 }
 
+type deletedMsg struct{ err error }
+
+// deleteCmd permanently removes namespace/name's record, log, and any
+// private session data (`muro sandbox delete`, DESIGN.md §9) — issued by
+// handleKey's screenConfirmDelete branch after the operator presses y to
+// confirm. DiscardWorktrees is deliberately left empty: a sandbox with an
+// unmerged git worktree refuses to delete outright rather than silently
+// discarding real code (DESIGN.md §15), and the TUI has no affordance yet
+// for reviewing/accepting that loss — the resulting error surfaces via
+// m.err exactly like any other failed command, same as the CLI without
+// --discard-worktree.
+func deleteCmd(namespace, name string) tea.Cmd {
+	return func() tea.Msg {
+		c, err := control.Dial(control.ResolveSocketPath())
+		if err != nil {
+			return deletedMsg{err: err}
+		}
+		defer c.Close()
+		req := control.SandboxDeleteRequest{Namespace: namespace, Name: name}
+		if err := c.Call(control.TypeSandboxDelete, req, nil); err != nil {
+			return deletedMsg{err: err}
+		}
+		return deletedMsg{}
+	}
+}
+
 // restartedMsg is restartCmd's result — carries namespace/name (unlike
 // stoppedMsg) since a successful restart is immediately followed by
 // switchToCmd to attach, which needs to know which sandbox to attach to.

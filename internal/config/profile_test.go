@@ -241,6 +241,7 @@ func TestLoadProfile_ExtendsSingleValueFieldsChildWinsWhenSet(t *testing.T) {
 		Agent:         "/base/agent",
 		AgentArgs:     []string{"--base-flag"},
 		RestartPolicy: "always",
+		WorkDir:       "/base-workdir",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -249,6 +250,7 @@ func TestLoadProfile_ExtendsSingleValueFieldsChildWinsWhenSet(t *testing.T) {
 		Extends:   "base",
 		Agent:     "/child/agent",
 		AgentArgs: []string{"--child-flag"},
+		WorkDir:   "/child-workdir",
 		// RestartPolicy deliberately left unset — must inherit "always" from base.
 	}); err != nil {
 		t.Fatal(err)
@@ -266,6 +268,27 @@ func TestLoadProfile_ExtendsSingleValueFieldsChildWinsWhenSet(t *testing.T) {
 	}
 	if resolved.RestartPolicy != "always" {
 		t.Errorf("RestartPolicy = %q, want inherited \"always\" from base since child left it unset", resolved.RestartPolicy)
+	}
+	if resolved.WorkDir != "/child-workdir" {
+		t.Errorf("WorkDir = %q, want child's own value to win", resolved.WorkDir)
+	}
+}
+
+func TestLoadProfile_ExtendsWorkDirInheritedWhenChildLeavesItUnset(t *testing.T) {
+	t.Setenv("MURO_PROFILES_DIR", t.TempDir())
+	if err := SaveProfile(&Profile{Name: "base", WorkDir: "/workspace"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveProfile(&Profile{Name: "child", Extends: "base"}); err != nil {
+		t.Fatal(err)
+	}
+
+	resolved, err := LoadProfile("child")
+	if err != nil {
+		t.Fatalf("LoadProfile error: %v", err)
+	}
+	if resolved.WorkDir != "/workspace" {
+		t.Errorf("WorkDir = %q, want inherited \"/workspace\" from base since child left it unset", resolved.WorkDir)
 	}
 }
 

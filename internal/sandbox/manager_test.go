@@ -96,6 +96,46 @@ func TestRun_AgentArgsFlowIntoLaunchCmd(t *testing.T) {
 	}
 }
 
+// TestRun_QuietModeOverridesLaunchCmd proves a profile with quiet_mode:
+// true launches cmd/muro-quiet-chat instead of its configured Agent/
+// AgentArgs — the whole point of the feature (hide tool-call/diff noise
+// behind Claude Code's own print mode) depends on THIS process being what
+// actually runs in the sandbox, not the raw agent.
+func TestRun_QuietModeOverridesLaunchCmd(t *testing.T) {
+	t.Setenv("HOME", "/home/tester")
+	mgr, iso, _ := newTestManager(t)
+
+	p := testProfile("p1")
+	p.Agent = "/usr/bin/claude"
+	p.AgentArgs = []string{"--dangerously-skip-permissions"}
+	p.QuietMode = true
+	if _, err := mgr.Run(p, "agent-1", "default"); err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	got := iso.launched[len(iso.launched)-1].Cmd
+	want := []string{"/home/tester/.local/bin/muro-quiet-chat"}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Errorf("Cmd = %v, want %v (quiet mode must ignore Agent/AgentArgs entirely)", got, want)
+	}
+}
+
+func TestRun_QuietModeOffKeepsConfiguredAgent(t *testing.T) {
+	mgr, iso, _ := newTestManager(t)
+
+	p := testProfile("p1")
+	p.Agent = "/usr/bin/claude"
+	// QuietMode deliberately left false (the zero value).
+	if _, err := mgr.Run(p, "agent-1", "default"); err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	got := iso.launched[len(iso.launched)-1].Cmd
+	if len(got) != 1 || got[0] != "/usr/bin/claude" {
+		t.Errorf("Cmd = %v, want the profile's own agent unmodified", got)
+	}
+}
+
 func TestRun_CreatesSandbox(t *testing.T) {
 	mgr, iso, pub := newTestManager(t)
 
@@ -445,6 +485,52 @@ func TestRestart_WithoutFromProfileIgnoresProfileChange(t *testing.T) {
 	sb, _ := mgr.store.Get("default", "agent-1")
 	if len(sb.Mounts) != 0 {
 		t.Errorf("Mounts after plain restart = %+v, want unchanged (empty) — restart without --from-profile must not read the profile file", sb.Mounts)
+	}
+}
+
+// TestRestart_ReestablishesProxyAllowlist guards a real bug found while
+// debugging a "claude -p" failure inside an actual running sandbox: after
+// murod itself restarts, ReattachAll is what repopulates the fresh
+// in-memory proxy's allowlist for a still-running sandbox — but that only
+// runs for sandboxes state.Reconcile found StateRunning at that exact
+// moment, and its own errors are logged, not fatal (murod's main.go). A
+// sandbox that raced past that (or whose Reattach itself failed) starts
+// this murod process with NO allowlist entry for its ID at all. Restart
+// used to assume the allowlist "doesn't need re-setting" since it's keyed
+// by the stable sandbox ID — true only if some entry already exists; false
+// in exactly this gap, and every one of that sandbox's requests then got
+// silently denied by the fail-closed proxy for the rest of this murod
+// process's life, confirmed live via `journalctl -u murod` showing
+// "proxy: denied ... host=api.anthropic.com" for a profile whose
+// allow_urls plainly included it.
+func TestRestart_ReestablishesProxyAllowlist(t *testing.T) {
+	t.Setenv("MURO_PROFILES_DIR", t.TempDir())
+	store := state.NewStore(filepath.Join(t.TempDir(), "state.json"))
+	iso := newFakeIsolator()
+	proxy := &fakeProxy{}
+	mgr := NewManager(store, iso, proxy, &fakePublisher{})
+	mgr.sleep = func(time.Duration) {}
+
+	p := testProfile("p1")
+	p.AllowURLs = []string{"https://api.anthropic.com"}
+	sb, err := mgr.Run(p, "agent-1", "default")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	// Simulate landing on a fresh murod process whose in-memory proxy never
+	// got this sandbox's allowlist populated (the bug's exact precondition).
+	proxy.calls = nil
+
+	if err := mgr.Restart("default", "agent-1", false); err != nil {
+		t.Fatalf("Restart error: %v", err)
+	}
+
+	got := proxy.calls[sb.ID]
+	if len(got) != 1 || got[0] != "https://api.anthropic.com" {
+		t.Errorf("proxy allowlist for sandbox %q after Restart = %v, want [%q] re-set — "+
+			"Restart must always re-populate the in-memory proxy's allowlist, never assume it's already there",
+			sb.ID, got, "https://api.anthropic.com")
 	}
 }
 

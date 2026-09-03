@@ -153,6 +153,22 @@ func TestBuildArgs_UnshareFlagsAndScaffolding(t *testing.T) {
 	}
 }
 
+func TestBuildArgs_DefaultChdirIsRoot(t *testing.T) {
+	b := &BwrapIsolator{}
+	args := b.buildArgs(LaunchSpec{Cmd: []string{"/bin/true"}}) // WorkDir unset
+	if !containsSeq(args, "--chdir", "/") {
+		t.Errorf("expected --chdir / when WorkDir is unset, got %v", args)
+	}
+}
+
+func TestBuildArgs_WorkDirSetsChdir(t *testing.T) {
+	b := &BwrapIsolator{}
+	args := b.buildArgs(LaunchSpec{Cmd: []string{"/bin/true"}, WorkDir: "/workspace"})
+	if !containsSeq(args, "--chdir", "/workspace") {
+		t.Errorf("expected --chdir /workspace when WorkDir is set, got %v", args)
+	}
+}
+
 // TestBuildArgs_NeverDieWithParent guards against a real bug found via a
 // live end-to-end test: --die-with-parent kills the sandboxed process the
 // instant murod itself exits — including a clean shutdown/restart, not

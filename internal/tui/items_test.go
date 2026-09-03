@@ -31,3 +31,56 @@ func TestProfileItem_TitleAndFilterValueUseName(t *testing.T) {
 		t.Errorf("Title/FilterValue = %q/%q, want code-reviewer for both", i.Title(), i.FilterValue())
 	}
 }
+
+func TestSortedNamespaces_DistinctSortedNoDuplicates(t *testing.T) {
+	got := sortedNamespaces([]*control.SandboxView{
+		{Namespace: "duo", Name: "frank2"},
+		{Namespace: "default", Name: "zzz"},
+		{Namespace: "duo", Name: "frank1"},
+		{Namespace: "default", Name: "aaa"},
+	})
+	want := []string{"default", "duo"}
+	if len(got) != len(want) {
+		t.Fatalf("sortedNamespaces() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("sortedNamespaces()[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestSortedNamespaces_EmptyInputProducesNoNamespaces(t *testing.T) {
+	if got := sortedNamespaces(nil); len(got) != 0 {
+		t.Errorf("sortedNamespaces(nil) = %v, want none", got)
+	}
+}
+
+func TestSandboxItemsForNamespace_FiltersAndSortsByName(t *testing.T) {
+	items := sandboxItemsForNamespace([]*control.SandboxView{
+		{Namespace: "duo", Name: "frank2"},
+		{Namespace: "default", Name: "zzz"},
+		{Namespace: "duo", Name: "frank1"},
+		{Namespace: "default", Name: "aaa"},
+	}, "duo")
+
+	wantNames := []string{"frank1", "frank2"}
+	if len(items) != len(wantNames) {
+		t.Fatalf("sandboxItemsForNamespace(..., \"duo\") returned %d items, want %d: %+v", len(items), len(wantNames), items)
+	}
+	for i, want := range wantNames {
+		sb, ok := items[i].(sandboxItem)
+		if !ok || sb.view.Name != want {
+			t.Errorf("items[%d] = %+v, want sandboxItem for %q", i, items[i], want)
+		}
+	}
+}
+
+func TestSandboxItemsForNamespace_NoMatchesReturnsEmpty(t *testing.T) {
+	items := sandboxItemsForNamespace([]*control.SandboxView{
+		{Namespace: "default", Name: "a"},
+	}, "duo")
+	if len(items) != 0 {
+		t.Errorf("sandboxItemsForNamespace() for a namespace with no sandboxes = %+v, want none", items)
+	}
+}

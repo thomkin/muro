@@ -193,6 +193,10 @@ func ValidateProfile(p *Profile) error {
 		return fmt.Errorf("profile %q: invalid restart_policy %q (must be never, on-failure, or always)", p.Name, p.RestartPolicy)
 	}
 
+	if p.WorkDir != "" && !strings.HasPrefix(p.WorkDir, "/") {
+		return fmt.Errorf("profile %q: workdir %q must be an absolute sandbox-internal path", p.Name, p.WorkDir)
+	}
+
 	toolTargets := make(map[string]Tool, len(p.Tools))
 	for _, t := range p.Tools {
 		if t.As == "" || t.As == "*" {

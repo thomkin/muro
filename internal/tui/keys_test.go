@@ -101,3 +101,16 @@ func TestKeyBytes_UnrecognizedKeyReturnsNil(t *testing.T) {
 		t.Errorf("keyBytes(F1) = %v, want nil (unrecognized, dropped)", got)
 	}
 }
+
+// TestKeyBytes_CtrlLeftReturnsNil locks in the zero-collision claim
+// model.go's handleKey relies on for repurposing Ctrl-Left as a
+// client-side "back to the list" shortcut: since it was never forwarded to
+// the attached agent in the first place (only plain arrows are in
+// negativeKeySequences), intercepting it client-side takes nothing away
+// from what the agent used to receive.
+func TestKeyBytes_CtrlLeftReturnsNil(t *testing.T) {
+	got := keyBytes(tea.KeyMsg(tea.Key{Type: tea.KeyCtrlLeft}))
+	if got != nil {
+		t.Errorf("keyBytes(ctrl+left) = %v, want nil (never forwarded, so repurposing it client-side is collision-free)", got)
+	}
+}

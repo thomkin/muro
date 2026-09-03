@@ -31,6 +31,17 @@ type Sandbox struct {
 	Profile   string   `json:"profile"`
 	Agent     string   `json:"agent"`
 	AgentArgs []string `json:"agent_args,omitempty"`
+	// WorkDir is this sandbox's launch-time working directory, resolved
+	// once from the launching profile's own WorkDir field at Run time and
+	// persisted here — same "resolved once, carried forward" pattern as
+	// Env below. Empty means "/", bwrap's long-standing default.
+	WorkDir string `json:"workdir,omitempty"`
+	// QuietMode records whether this sandbox launches Claude Code's own
+	// print-mode wrapper (cmd/muro-quiet-chat) instead of the agent
+	// directly, resolved once from the launching profile's own QuietMode
+	// field at Run time and persisted here — same "resolved once, carried
+	// forward" pattern as Audio below.
+	QuietMode bool `json:"quiet_mode,omitempty"`
 	// Env is this sandbox's launch-time environment, resolved once from the
 	// launching profile's own Env field at Run time and persisted here —
 	// the same "resolved once, carried forward" pattern every other

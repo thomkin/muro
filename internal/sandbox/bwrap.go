@@ -316,7 +316,11 @@ func (b *BwrapIsolator) buildArgs(spec LaunchSpec) []string {
 		args = append(args, "--setenv", k, env[k])
 	}
 
-	args = append(args, "--chdir", "/")
+	chdir := "/"
+	if spec.WorkDir != "" {
+		chdir = spec.WorkDir
+	}
+	args = append(args, "--chdir", chdir)
 	args = append(args, "--")
 	args = append(args, spec.Cmd...)
 	return args

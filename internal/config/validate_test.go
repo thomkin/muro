@@ -38,6 +38,27 @@ func TestValidateProfile_InvalidRestartPolicy(t *testing.T) {
 	}
 }
 
+func TestValidateProfile_EmptyWorkDirOK(t *testing.T) {
+	p := &Profile{Name: "no-workdir", Agent: "claude"}
+	if err := ValidateProfile(p); err != nil {
+		t.Errorf("ValidateProfile() with empty workdir = %v, want nil", err)
+	}
+}
+
+func TestValidateProfile_AbsoluteWorkDirOK(t *testing.T) {
+	p := &Profile{Name: "workdir-profile", Agent: "claude", WorkDir: "/workspace"}
+	if err := ValidateProfile(p); err != nil {
+		t.Errorf("ValidateProfile() with absolute workdir = %v, want nil", err)
+	}
+}
+
+func TestValidateProfile_RelativeWorkDirRejected(t *testing.T) {
+	p := &Profile{Name: "bad-workdir", Agent: "claude", WorkDir: "workspace"}
+	if err := ValidateProfile(p); err == nil {
+		t.Error("expected an error for a non-absolute workdir")
+	}
+}
+
 func TestValidateProfile_RequiresName(t *testing.T) {
 	if err := ValidateProfile(&Profile{}); err == nil {
 		t.Error("expected an error for a profile with no name")
